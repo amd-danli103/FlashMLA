@@ -6,7 +6,7 @@ import random
 
 import torch
 import kernelkit as kk
-import flash_mla
+# import flash_mla  # Removed FlashMLA dependency
 
 import quant
 
@@ -307,31 +307,32 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
     return TestcaseForDecode(t, q, attn_sink, sm_scale, kv_scope0, kv_scope1)
 
 
-def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
-    assert not return_p_sum
-    return flash_mla.flash_mla_sparse_fwd(
-        t.q, t.kv, t.indices,
-        sm_scale=t.sm_scale,
-        attn_sink=t.attn_sink,
-        topk_length=t.topk_length
-    )
+# Commented out FlashMLA functions - not available in this environment
+# def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
+#     assert not return_p_sum
+#     return flash_mla.flash_mla_sparse_fwd(
+#         t.q, t.kv, t.indices,
+#         sm_scale=t.sm_scale,
+#         attn_sink=t.attn_sink,
+#         topk_length=t.topk_length
+#     )
 
-def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
-    assert p.decode is not None
-    return flash_mla.flash_mla_with_kvcache(
-        t.q,
-        t.kv_scope.get_kvcache_for_flash_mla(),
-        None, None, p.d_v,
-        tile_scheduler_metadata, num_splits,
-
-        t.sm_scale, False, True,
-        t.kv_scope.indices_in_kvcache,
-        t.attn_sink,
-        t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
-        t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
-        t.kv_scope.topk_length,
-        t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
-    )
+# def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
+#     assert p.decode is not None
+#     return flash_mla.flash_mla_with_kvcache(
+#         t.q,
+#         t.kv_scope.get_kvcache_for_flash_mla(),
+#         None, None, p.d_v,
+#         tile_scheduler_metadata, num_splits,
+#
+#         t.sm_scale, False, True,
+#         t.kv_scope.indices_in_kvcache,
+#         t.attn_sink,
+#         t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
+#         t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
+#         t.kv_scope.topk_length,
+#         t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
+#     )
 
 
 @dataclasses.dataclass
