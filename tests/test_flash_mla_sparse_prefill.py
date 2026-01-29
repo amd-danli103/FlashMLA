@@ -7,6 +7,7 @@ import kernelkit as kk
 from lib import TestParam
 import lib
 import ref
+from triton_mla_kernels import triton_sparse_attn_fwd
 
 _counter = kk.Counter()
 
@@ -23,21 +24,30 @@ def run_test(p: TestParam) -> bool:
     t = lib.generate_testcase(p)
     torch.cuda.synchronize()
 
-    # Modified to call ref implementation instead of FlashMLA
-    def run_prefill():
-        # return lib.run_flash_mla_sparse_fwd(p, t, False)
-        return ref.ref_sparse_attn_fwd(p, t)
+    # Call Triton implementation
+    def run_triton():
+        return triton_sparse_attn_fwd(t.q, t.kv, t.indices, t.sm_scale, p.d_v, t.attn_sink, t.topk_length)
 
-    prefill_ans_out, prefill_ans_out_fp32, prefill_ans_max_logits, prefill_ans_lse = run_prefill()
+    prefill_ans_out, prefill_ans_out_fp32, prefill_ans_max_logits, prefill_ans_lse = run_triton()
     torch.cuda.synchronize()
 
     if p.num_runs > 0:
         flops_and_mem_vol = lib.count_flop_and_mem_vol(p, t)
-        # Note: ref implementation doesn't have a specific kernel name, so we just measure the entire function
-        prefill_ans_time = kk.bench_by_cuda_events(run_prefill, num_warmups_each=5, num_runs_each=p.num_runs)
-        prefill_flops = flops_and_mem_vol.fwd_flop/prefill_ans_time/1e12
-        prefill_mem_bw = flops_and_mem_vol.fwd_mem_vol/prefill_ans_time/1e12
-        print(f"Prefill (ref):  {prefill_ans_time*1e6:4.0f} us, {prefill_flops:6.1f} TFlops, {prefill_mem_bw:4.2f} TBps")
+
+        # Benchmark Triton implementation
+        triton_time = kk.bench_by_cuda_events(run_triton, num_warmups_each=5, num_runs_each=p.num_runs)
+        triton_flops = flops_and_mem_vol.fwd_flop/triton_time/1e12
+        triton_mem_bw = flops_and_mem_vol.fwd_mem_vol/triton_time/1e12
+        print(f"Triton:  {triton_time*1e6:4.0f} us, {triton_flops:6.1f} TFlops, {triton_mem_bw:4.2f} TBps")
+
+        # Benchmark reference implementation for comparison
+        def run_ref():
+            return ref.ref_sparse_attn_fwd(p, t)
+        ref_time = kk.bench_by_cuda_events(run_ref, num_warmups_each=5, num_runs_each=p.num_runs)
+        ref_flops = flops_and_mem_vol.fwd_flop/ref_time/1e12
+        ref_mem_bw = flops_and_mem_vol.fwd_mem_vol/ref_time/1e12
+        print(f"Ref:     {ref_time*1e6:4.0f} us, {ref_flops:6.1f} TFlops, {ref_mem_bw:4.2f} TBps")
+        print(f"Speedup: {ref_time/triton_time:.2f}x")
 
     if p.check_correctness:
         torch.cuda.synchronize()

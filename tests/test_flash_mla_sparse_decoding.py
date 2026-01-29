@@ -9,12 +9,11 @@ import rich.table
 import torch
 import kernelkit as kk
 
-# import flash_mla
-
 import lib
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
 import ref
+from triton_mla_kernels import triton_sparse_attn_decode
 
 """
 Generate testcase for unit test
@@ -151,18 +150,18 @@ def test_flash_mla(p: TestParam) -> Result:
 
     t = lib.generate_testcase_for_decode(p)
 
-    # Modified to call ref implementation instead of FlashMLA
-    # tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
-    def run_decode():
-        # return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None)
+    # Call Triton implementation
+    def run_triton():
+        return triton_sparse_attn_decode(t.q, t.kv_scope, t.extra_kv_scope, t.sm_scale, p.d_v, t.attn_sink)
+
+    # Call reference implementation
+    def run_ref():
         return ref.ref_sparse_attn_decode(p, t)
     
     # We first run the kernel once to generate output data for the correctness test
-    # We must do this first, otherwise when allocating tensors for storing answers,
-    # it may re-use memory that contains the correct answer, leading to false positives
     if p.check_correctness:
         torch.cuda.synchronize()
-        out_ans, lse_ans = run_decode()
+        out_ans, lse_ans = run_triton()
         torch.cuda.synchronize()
     
     # We run the performance test before generating the answer for the correctness test to avoid interference
@@ -170,20 +169,22 @@ def test_flash_mla(p: TestParam) -> Result:
     if p.num_runs == 0:
         performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     else:
-        e2e_time_usage_us = kk.bench_by_cuda_events(run_decode, num_warmups_each=5, num_runs_each=p.num_runs) * 1e6
+        triton_time_us = kk.bench_by_cuda_events(run_triton, num_warmups_each=5, num_runs_each=p.num_runs) * 1e6
+        ref_time_us = kk.bench_by_cuda_events(run_ref, num_warmups_each=5, num_runs_each=p.num_runs) * 1e6
 
         flops_and_mem_vol = lib.count_flop_and_mem_vol_for_decode(p, t)
 
-        e2e_time_usage_s = e2e_time_usage_us / 1e6
+        triton_time_s = triton_time_us / 1e6
         theoritical_compute_memory_ratio = flops_and_mem_vol.flop / flops_and_mem_vol.mem_vol
-        achieved_tflops = flops_and_mem_vol.flop / e2e_time_usage_s / 1e12
-        achieved_gBps = flops_and_mem_vol.mem_vol / e2e_time_usage_s / 1e9
+        achieved_tflops = flops_and_mem_vol.flop / triton_time_s / 1e12
+        achieved_gBps = flops_and_mem_vol.mem_vol / triton_time_s / 1e9
+        speedup = ref_time_us / triton_time_us
         print(f'Compute/Memory: {theoritical_compute_memory_ratio:.2f}')
-        print(f'Time (ref): {e2e_time_usage_us:.1f} us')
+        print(f'Time (Triton): {triton_time_us:.1f} us, Time (Ref): {ref_time_us:.1f} us, Speedup: {speedup:.2f}x')
         print(f'TFlops: {achieved_tflops:.1f}')
         print(f'GB/s: {achieved_gBps:.0f}')
 
-        performance_result = Result(True, theoritical_compute_memory_ratio, e2e_time_usage_us, 0.0, 0.0, achieved_tflops, achieved_gBps)
+        performance_result = Result(True, theoritical_compute_memory_ratio, triton_time_us, 0.0, 0.0, achieved_tflops, achieved_gBps)
     
     is_correct = True
     if p.check_correctness:
