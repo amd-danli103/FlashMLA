@@ -5,6 +5,7 @@ Key optimizations:
 1. Pre-gather KV using PyTorch's optimized index_select
 2. Process multiple heads per block using tl.dot for tensor core utilization
 3. Online softmax to avoid materializing full attention matrix
+4. Triton autotune mechanism to automatically select optimal BLOCK_H, BLOCK_N, and num_warps
 """
 
 import torch
@@ -13,6 +14,29 @@ import triton.language as tl
 from typing import Optional, Tuple
 
 
+@triton.autotune(
+    configs=[
+        # Small dimensions (d_qk/d_v <= 512)
+        triton.Config({'BLOCK_H': 32, 'BLOCK_N': 16, 'BLOCK_D': 512}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_H': 32, 'BLOCK_N': 32, 'BLOCK_D': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 64, 'BLOCK_N': 16, 'BLOCK_D': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 64, 'BLOCK_N': 32, 'BLOCK_D': 512}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_H': 64, 'BLOCK_N': 64, 'BLOCK_D': 512}, num_warps=8, num_stages=2),
+
+        # Medium dimensions (512 < d_qk/d_v <= 1024)
+        triton.Config({'BLOCK_H': 16, 'BLOCK_N': 16, 'BLOCK_D': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 32, 'BLOCK_N': 16, 'BLOCK_D': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 32, 'BLOCK_N': 32, 'BLOCK_D': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_H': 64, 'BLOCK_N': 16, 'BLOCK_D': 1024}, num_warps=8, num_stages=2),
+
+        # Large dimensions (d_qk/d_v > 1024)
+        triton.Config({'BLOCK_H': 8, 'BLOCK_N': 16, 'BLOCK_D': 2048}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 16, 'BLOCK_N': 16, 'BLOCK_D': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_H': 16, 'BLOCK_N': 32, 'BLOCK_D': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_H': 32, 'BLOCK_N': 16, 'BLOCK_D': 2048}, num_warps=8, num_stages=3),
+    ],
+    key=['s_q', 'h_q', 'topk', 'd_qk', 'd_v'],
+)
 @triton.jit
 def _multihead_sparse_attention_kernel(
     Q, GatheredKV, InvalidMask,
@@ -30,8 +54,11 @@ def _multihead_sparse_attention_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """
-    Multi-head sparse attention kernel.
+    Multi-head sparse attention kernel with autotune support.
     Processes BLOCK_H heads per block using tl.dot for tensor core utilization.
+
+    Autotune will automatically select optimal BLOCK_H, BLOCK_N, BLOCK_D, and num_warps
+    based on input dimensions (s_q, h_q, topk, d_qk, d_v).
 
     Grid: (s_q, cdiv(h_q, BLOCK_H))
     """
@@ -114,6 +141,26 @@ def triton_sparse_attn_fwd_optimized(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimized sparse attention using pre-gathered KV and multi-head Triton kernel.
+
+    This function uses Triton's autotune mechanism to automatically select the optimal
+    kernel configuration (BLOCK_H, BLOCK_N, num_warps, num_stages) based on input dimensions.
+    The autotune key is [s_q, h_q, topk, d_qk, d_v], so kernels with the same dimensions
+    will reuse the cached optimal configuration.
+
+    Args:
+        q: Query tensor of shape (s_q, h_q, d_qk)
+        kv: Key-Value tensor of shape (s_kv, h_kv, d_qk)
+        indices: Sparse indices of shape (s_q, 1, topk)
+        sm_scale: Softmax scale factor
+        d_v: Value dimension (default: 512)
+        attn_sink: Optional attention sink logits of shape (h_q,)
+        topk_length: Optional per-query actual topk length of shape (s_q,)
+
+    Returns:
+        - Output in bfloat16 of shape (s_q, h_q, d_v)
+        - Output in float32 of shape (s_q, h_q, d_v)
+        - Max logits of shape (s_q, h_q)
+        - Log-sum-exp of shape (s_q, h_q)
     """
     s_q, h_q, d_qk = q.shape
     s_kv, h_kv, _ = kv.shape
@@ -138,6 +185,7 @@ def triton_sparse_attn_fwd_optimized(
     q_contig = q.contiguous()
     invalid_mask_contig = invalid_mask.contiguous()
 
+    # Determine BLOCK_D based on dimensions (for autotune key matching)
     if d_qk <= 512 and d_v <= 512:
         BLOCK_D = 512
     elif d_qk <= 1024 and d_v <= 1024:
@@ -145,10 +193,11 @@ def triton_sparse_attn_fwd_optimized(
     else:
         BLOCK_D = 2048
 
-    BLOCK_H = 64
-    BLOCK_N = 32
+    # Note: BLOCK_H and BLOCK_N will be determined by autotune
+    # We use a default BLOCK_H for grid calculation, autotune will optimize it
+    BLOCK_H_DEFAULT = 64
 
-    grid = (s_q, triton.cdiv(h_q, BLOCK_H))
+    grid = lambda meta: (s_q, triton.cdiv(h_q, meta['BLOCK_H']))
 
     _multihead_sparse_attention_kernel[grid](
         q_contig, gathered_kv, invalid_mask_contig,
@@ -161,10 +210,6 @@ def triton_sparse_attn_fwd_optimized(
         out_fp32.stride(0), out_fp32.stride(1), out_fp32.stride(2),
         max_logits.stride(0), max_logits.stride(1),
         lse.stride(0), lse.stride(1),
-        BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-        num_warps=4,
     )
 
     if attn_sink is not None:
