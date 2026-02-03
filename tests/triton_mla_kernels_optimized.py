@@ -14,6 +14,10 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
+# Use exp2 for better hardware utilization on AMD GPUs
+# Conversion: exp(x) = exp2(x * log2(e))
+LOG2E = 1.4426950408889634  # log2(e)
+
 
 @triton.autotune(
     configs=[
@@ -66,6 +70,9 @@ def _multihead_sparse_attention_kernel(
 
     Grid: (s_q, cdiv(h_q, BLOCK_H))
     """
+    # Use exp2 for better hardware utilization: exp(x) = exp2(x * log2(e))
+    LOG2E: tl.constexpr = 1.4426950408889634
+
     pid_sq = tl.program_id(0)
     pid_h_block = tl.program_id(1)
 
@@ -104,10 +111,15 @@ def _multihead_sparse_attention_kernel(
         idx_in_bounds = (kv_indices >= 0) & (kv_indices < s_kv)
         valid = ~invalid & mask_n & idx_in_bounds
 
-        # Vectorized in-kernel gather: compute pointers for all KV positions
-        # k_ptrs shape: [BLOCK_N, BLOCK_D]
-        k_ptrs = KV + kv_indices[:, None] * stride_kv_skv + offs_d[None, :] * stride_kv_d
-        k = tl.load(k_ptrs, mask=valid[:, None] & mask_d_qk[None, :], other=0.0).to(tl.float32)
+        # Optimized: Load KV once (eliminates 50% redundant memory access for K and V)
+        # In MLA, K and V share the same KV tensor, so we load once and mask separately
+        kv_ptrs = KV + kv_indices[:, None] * stride_kv_skv + offs_d[None, :] * stride_kv_d
+        kv = tl.load(kv_ptrs, mask=valid[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0).to(tl.float32)
+
+        # Apply dimension-specific masks to ensure K uses d_qk and V uses d_v
+        # This is necessary when d_qk != d_v to prevent using wrong dimensions
+        k = tl.where(mask_d_qk[None, :], kv, 0.0)
+        v = tl.where(mask_d_v[None, :], kv, 0.0)
 
         # Compute attention scores
         scores = tl.dot(q, tl.trans(k)) * sm_scale
@@ -117,18 +129,15 @@ def _multihead_sparse_attention_kernel(
         m_ij = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
 
-        alpha = tl.where(m_i == float("-inf"), 1.0, tl.exp(m_i - m_new))
-        p_raw = tl.exp(scores - m_new[:, None])
+        alpha = tl.where(m_i == float("-inf"), 1.0, tl.math.exp2((m_i - m_new) * LOG2E))
+        p_raw = tl.math.exp2((scores - m_new[:, None]) * LOG2E)
         p = tl.where(scores == float("-inf"), 0.0, p_raw)
 
         l_new = alpha * l_i + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
-        # Vectorized gather for V (same indices as K)
-        v_ptrs = KV + kv_indices[:, None] * stride_kv_skv + offs_d[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & mask_d_v[None, :], other=0.0).to(tl.float32)
-
-        acc = acc + tl.dot(p.to(v.dtype), v)
+        # V is already loaded and masked, no additional memory access needed
+        acc = acc + tl.dot(p, v)
 
         m_i = m_new
         l_i = l_new
@@ -138,8 +147,8 @@ def _multihead_sparse_attention_kernel(
     orig_lse = tl.where(has_valid, m_i + tl.log(l_i), float("-inf"))
     final_lse = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
 
-    lse_for_o = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
-    scale = tl.where(has_valid, tl.exp(m_i - lse_for_o), 0.0)
+    # Reuse final_lse for scaling (same computation as lse_for_o)
+    scale = tl.where(has_valid, tl.math.exp2((m_i - final_lse) * LOG2E), 0.0)
     acc = acc * scale[:, None]
 
     # Store outputs
@@ -222,7 +231,23 @@ def triton_sparse_attn_fwd_optimized(
     indices_contig = indices_2d.contiguous()
     invalid_mask_contig = invalid_mask.contiguous()
 
-    grid = lambda meta: (s_q, triton.cdiv(h_q, meta['BLOCK_H']))
+    # Optimize grid size to match MI355X's 256 CUs, ensuring grid is a multiple of CU count for better occupancy
+    def grid_fn(meta):
+        num_blocks_sq = s_q
+        num_blocks_h = triton.cdiv(h_q, meta['BLOCK_H'])
+        total_blocks = num_blocks_sq * num_blocks_h
+
+        # Round up to the nearest multiple of 256
+        target_cu = 256
+        padded_blocks = triton.cdiv(total_blocks, target_cu) * target_cu
+
+        # If padding is needed, add it to the second dimension
+        if padded_blocks > total_blocks:
+            num_blocks_h = triton.cdiv(padded_blocks, num_blocks_sq)
+
+        return (num_blocks_sq, num_blocks_h)
+
+    grid = grid_fn
 
     _multihead_sparse_attention_kernel[grid](
         q_contig, kv_contig, indices_contig, invalid_mask_contig,
@@ -248,7 +273,7 @@ def triton_sparse_attn_fwd_optimized(
         )
 
         lse_for_o_safe = torch.where(lse_for_o == float("-inf"), float("+inf"), lse_for_o)
-        scale = torch.where(orig_lse == float("-inf"), 0.0, torch.exp(orig_lse - lse_for_o_safe))
+        scale = torch.where(orig_lse == float("-inf"), 0.0, torch.exp2((orig_lse - lse_for_o_safe) * LOG2E))
         out_fp32 = out_fp32 * scale.unsqueeze(-1)
 
     return out_fp32.to(torch.bfloat16), out_fp32, max_logits, lse
