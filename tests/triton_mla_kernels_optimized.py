@@ -1,5 +1,5 @@
 """
-Optimized Triton implementation of MLA sparse attention prefill kernel - Version 6.
+Optimized Triton implementation of MLA sparse attention prefill kernel - Version 7.
 
 Key optimizations:
 1. Use tl.dot with proper BF16 inputs for tensor core acceleration
@@ -7,10 +7,7 @@ Key optimizations:
 3. Minimize register pressure by processing in smaller chunks
 4. Keep Q in registers, stream KV through
 5. In-kernel vectorized KV gathering - eliminates expensive pre-gathering
-
-Performance improvements vs previous version:
-- h_q=64, topk=512: ~1.33x faster (65 TFlops → 87 TFlops)
-- h_q=128, topk=1024: ~1.41x faster (72 TFlops → 102 TFlops)
+6. **NEW: Fused attention sink computation** - eliminates separate post-processing pass
 
 Matmul precision:
 - Q @ K^T and P @ V are computed in BF16 for tensor core acceleration
@@ -43,8 +40,9 @@ LOG2E = 1.4426950408889634
     key=['h_q', 'topk', 'd_qk'],
 )
 @triton.jit
-def _sparse_attn_fwd_v6(
+def _sparse_attn_fwd_fused(
     Q, KV, Indices, InvalidMask,
+    AttnSink,  # Attention sink logits [h_q] or None
     Out, MaxLogits, LSE,
     sm_scale,
     s_q, h_q, topk, d_qk: tl.constexpr, d_v: tl.constexpr, s_kv,
@@ -55,11 +53,12 @@ def _sparse_attn_fwd_v6(
     stride_o_sq, stride_o_hq, stride_o_d,
     stride_ml_sq, stride_ml_hq,
     stride_lse_sq, stride_lse_hq,
+    HAS_ATTN_SINK: tl.constexpr,  # Whether attention sink is provided
     BLOCK_M: tl.constexpr,  # Block size for heads
     BLOCK_N: tl.constexpr,  # Block size for KV
 ):
     """
-    Sparse attention with in-kernel gathering, optimized for tensor cores.
+    Sparse attention with in-kernel gathering and fused attention sink.
 
     Grid: (s_q, cdiv(h_q, BLOCK_M))
     """
@@ -113,7 +112,6 @@ def _sparse_attn_fwd_v6(
         v = tl.load(v_ptrs, mask=valid[:, None], other=0.0)
 
         # Compute Q @ K^T: [BLOCK_M, d_qk] @ [d_qk, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-        # Keep in BF16 for tensor cores, then convert result
         qk = tl.dot(q, tl.trans(k))
         qk = qk.to(tl.float32) * sm_scale
 
@@ -139,7 +137,6 @@ def _sparse_attn_fwd_v6(
         acc = acc * alpha[:, None]
 
         # Compute P @ V: [BLOCK_M, BLOCK_N] @ [BLOCK_N, d_v] -> [BLOCK_M, d_v]
-        # Convert p to BF16 for tensor cores
         pv = tl.dot(p.to(tl.bfloat16), v)
         acc = acc + pv.to(tl.float32)
 
@@ -147,22 +144,59 @@ def _sparse_attn_fwd_v6(
         m_i = m_new
         l_i = l_new
 
-    # Finalize
-    has_valid = l_i > 0
-    lse = tl.where(has_valid, m_i + tl.log(l_i), float("-inf"))
-    final_lse = tl.where(lse == float("-inf"), float("+inf"), lse)
-
-    # Final rescale
-    scale = tl.where(has_valid, tl.math.exp2((m_i - final_lse) * LOG2E), 0.0)
-    acc = acc * scale[:, None]
-
-    # Store outputs
+    # Store max_logits
     ml_ptrs = MaxLogits + pid_sq * stride_ml_sq + offs_m * stride_ml_hq
     tl.store(ml_ptrs, m_i, mask=mask_m)
 
+    # Compute orig_lse
+    has_valid = l_i > 0
+    orig_lse = tl.where(has_valid, m_i + tl.log(l_i), float("-inf"))
+
+    # Compute the LSE to use for output scaling
+    if HAS_ATTN_SINK:
+        # Load attention sink for this head block
+        sink_ptrs = AttnSink + offs_m
+        attn_sink = tl.load(sink_ptrs, mask=mask_m, other=float("-inf"))
+
+        # Handle special cases for +inf and -inf
+        sink_is_pos_inf = attn_sink == float("+inf")
+        sink_is_neg_inf = attn_sink == float("-inf")
+        orig_is_neg_inf = orig_lse == float("-inf")
+
+        # Compute logsumexp(orig_lse, attn_sink)
+        max_lse = tl.maximum(orig_lse, attn_sink)
+
+        # Safe exp computation
+        exp_orig = tl.where(orig_is_neg_inf | sink_is_pos_inf, 0.0,
+                           tl.math.exp2((orig_lse - max_lse) * LOG2E))
+        exp_sink = tl.where(sink_is_neg_inf | sink_is_pos_inf, 0.0,
+                           tl.math.exp2((attn_sink - max_lse) * LOG2E))
+        exp_sink = tl.where(sink_is_pos_inf, 1.0, exp_sink)
+
+        sum_exp = exp_orig + exp_sink
+
+        # Compute lse_for_o
+        lse_for_o = tl.where(sink_is_pos_inf, float("+inf"),
+                    tl.where(orig_is_neg_inf & sink_is_neg_inf, float("-inf"),
+                            max_lse + tl.log(sum_exp)))
+
+        # Convert -inf to +inf for safe division
+        lse_for_o_safe = tl.where(lse_for_o == float("-inf"), float("+inf"), lse_for_o)
+    else:
+        # No attention sink - use orig_lse
+        lse_for_o_safe = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
+
+    # Final rescale: acc contains sum(exp(qk - m_i) * V)
+    # We need: sum(exp(qk - lse_for_o) * V) = acc * exp(m_i - lse_for_o)
+    scale = tl.where(has_valid, tl.math.exp2((m_i - lse_for_o_safe) * LOG2E), 0.0)
+    acc = acc * scale[:, None]
+
+    # Store LSE (original LSE, not the combined one)
+    final_lse = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
     lse_ptrs = LSE + pid_sq * stride_lse_sq + offs_m * stride_lse_hq
     tl.store(lse_ptrs, final_lse, mask=mask_m)
 
+    # Store output
     out_ptrs = Out + pid_sq * stride_o_sq + offs_m[:, None] * stride_o_hq + offs_dv[None, :] * stride_o_d
     tl.store(out_ptrs, acc, mask=mask_m[:, None])
 
@@ -177,25 +211,7 @@ def triton_sparse_attn_fwd_optimized(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Optimized sparse attention with tensor core utilization.
-
-    This implementation uses BF16 for matmul operations (tensor cores) while
-    keeping accumulation in FP32 for numerical stability.
-
-    Args:
-        q: Query tensor of shape (s_q, h_q, d_qk)
-        kv: Key-Value tensor of shape (s_kv, d_qk) for MLA or (s_kv, h_kv, d_qk) for MHA
-        indices: Sparse indices of shape (s_q, 1, topk)
-        sm_scale: Softmax scale factor
-        d_v: Value dimension (default: 512)
-        attn_sink: Optional attention sink logits of shape (h_q,)
-        topk_length: Optional per-query actual topk length of shape (s_q,)
-
-    Returns:
-        - Output in bfloat16 of shape (s_q, h_q, d_v)
-        - Output in float32 of shape (s_q, h_q, d_v)
-        - Max logits of shape (s_q, h_q)
-        - Log-sum-exp of shape (s_q, h_q)
+    Optimized sparse attention with tensor core utilization and fused attention sink.
     """
     s_q, h_q, d_qk = q.shape
 
@@ -224,11 +240,19 @@ def triton_sparse_attn_fwd_optimized(
     indices_contig = indices_2d.contiguous()
     invalid_mask_contig = invalid_mask.contiguous()
 
+    # Prepare attention sink
+    has_attn_sink = attn_sink is not None
+    if has_attn_sink:
+        attn_sink_contig = attn_sink.contiguous().to(torch.float32)
+    else:
+        attn_sink_contig = torch.empty(h_q, dtype=torch.float32, device=q.device)
+
     def grid_fn(meta):
         return (s_q, triton.cdiv(h_q, meta['BLOCK_M']))
 
-    _sparse_attn_fwd_v6[grid_fn](
+    _sparse_attn_fwd_fused[grid_fn](
         q_contig, kv_2d, indices_contig, invalid_mask_contig,
+        attn_sink_contig,
         out_fp32, max_logits, lse,
         sm_scale,
         s_q, h_q, topk, d_qk, d_v, s_kv,
@@ -239,19 +263,7 @@ def triton_sparse_attn_fwd_optimized(
         out_fp32.stride(0), out_fp32.stride(1), out_fp32.stride(2),
         max_logits.stride(0), max_logits.stride(1),
         lse.stride(0), lse.stride(1),
+        HAS_ATTN_SINK=has_attn_sink,
     )
-
-    if attn_sink is not None:
-        orig_lse = lse.clone()
-        orig_lse[orig_lse == float("+inf")] = float("-inf")
-
-        lse_for_o = torch.logsumexp(
-            torch.stack([orig_lse, attn_sink.view(1, h_q).expand(s_q, h_q)], dim=0),
-            dim=0
-        )
-
-        lse_for_o_safe = torch.where(lse_for_o == float("-inf"), float("+inf"), lse_for_o)
-        scale = torch.where(orig_lse == float("-inf"), 0.0, torch.exp2((orig_lse - lse_for_o_safe) * LOG2E))
-        out_fp32 = out_fp32 * scale.unsqueeze(-1)
 
     return out_fp32.to(torch.bfloat16), out_fp32, max_logits, lse
