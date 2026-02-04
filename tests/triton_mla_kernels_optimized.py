@@ -1,5 +1,5 @@
 """
-Optimized Triton implementation of MLA sparse attention prefill kernel - Version 7.
+Optimized Triton implementation of MLA sparse attention prefill kernel - Version 8.
 
 Key optimizations:
 1. Use tl.dot with proper BF16 inputs for tensor core acceleration
@@ -7,7 +7,13 @@ Key optimizations:
 3. Minimize register pressure by processing in smaller chunks
 4. Keep Q in registers, stream KV through
 5. In-kernel vectorized KV gathering - eliminates expensive pre-gathering
-6. **NEW: Fused attention sink computation** - eliminates separate post-processing pass
+6. Fused attention sink computation - eliminates separate post-processing pass
+7. **NEW: Reduced control flow overhead**
+   - Pre-compute base pointers outside the loop
+   - Use clamped indices for safe memory access (bounds check moved to Python)
+   - Simplified valid mask computation
+   - Use predicated execution where possible
+   - Fixed NaN handling for edge cases (all invalid indices)
 
 Matmul precision:
 - Q @ K^T and P @ V are computed in BF16 for tensor core acceleration
@@ -40,9 +46,9 @@ LOG2E = 1.4426950408889634
     key=['h_q', 'topk', 'd_qk'],
 )
 @triton.jit
-def _sparse_attn_fwd_fused(
+def _sparse_attn_fwd_v8(
     Q, KV, Indices, InvalidMask,
-    AttnSink,  # Attention sink logits [h_q] or None
+    AttnSink,
     Out, MaxLogits, LSE,
     sm_scale,
     s_q, h_q, topk, d_qk: tl.constexpr, d_v: tl.constexpr, s_kv,
@@ -53,16 +59,17 @@ def _sparse_attn_fwd_fused(
     stride_o_sq, stride_o_hq, stride_o_d,
     stride_ml_sq, stride_ml_hq,
     stride_lse_sq, stride_lse_hq,
-    HAS_ATTN_SINK: tl.constexpr,  # Whether attention sink is provided
-    BLOCK_M: tl.constexpr,  # Block size for heads
-    BLOCK_N: tl.constexpr,  # Block size for KV
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """
-    Sparse attention with in-kernel gathering and fused attention sink.
+    Sparse attention with reduced control flow overhead.
 
     Grid: (s_q, cdiv(h_q, BLOCK_M))
     """
     LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF: tl.constexpr = float("-inf")
 
     pid_sq = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -70,129 +77,136 @@ def _sparse_attn_fwd_fused(
     if pid_sq >= s_q:
         return
 
-    # Head indices for this block
+    # Pre-compute head indices and mask
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < h_q
 
-    # Dimension indices
+    # Pre-compute dimension indices
     offs_d = tl.arange(0, d_qk)
     offs_dv = tl.arange(0, d_v)
 
-    # Load Q: [BLOCK_M, d_qk]
-    q_ptrs = Q + pid_sq * stride_q_sq + offs_m[:, None] * stride_q_hq + offs_d[None, :] * stride_q_d
+    # Pre-compute base pointers
+    q_base = Q + pid_sq * stride_q_sq
+    idx_base = Indices + pid_sq * stride_idx_sq
+    mask_base = InvalidMask + pid_sq * stride_mask_sq
+
+    # Load Q once
+    q_ptrs = q_base + offs_m[:, None] * stride_q_hq + offs_d[None, :] * stride_q_d
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
     # Initialize accumulators
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], NEG_INF, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, d_v], dtype=tl.float32)
 
-    # Iterate over KV blocks
+    # Pre-compute KV dimension offsets
+    kv_d_offs = offs_d[None, :] * stride_kv_d
+    kv_dv_offs = offs_dv[None, :] * stride_kv_d
+
+    # Main loop
     for n_start in range(0, topk, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < topk
 
         # Load indices
-        idx_ptrs = Indices + pid_sq * stride_idx_sq + offs_n * stride_idx_topk
+        idx_ptrs = idx_base + offs_n * stride_idx_topk
         kv_idx = tl.load(idx_ptrs, mask=mask_n, other=0)
 
         # Load invalid mask
-        inv_ptrs = InvalidMask + pid_sq * stride_mask_sq + offs_n * stride_mask_topk
+        inv_ptrs = mask_base + offs_n * stride_mask_topk
         invalid = tl.load(inv_ptrs, mask=mask_n, other=True)
 
         # Valid mask
-        valid = ~invalid & mask_n & (kv_idx >= 0) & (kv_idx < s_kv)
+        valid = (~invalid) & mask_n
 
-        # Load K: [BLOCK_N, d_qk]
-        k_ptrs = KV + kv_idx[:, None] * stride_kv_skv + offs_d[None, :] * stride_kv_d
-        k = tl.load(k_ptrs, mask=valid[:, None], other=0.0)
+        # Check if any valid in this block
+        any_valid = tl.sum(valid.to(tl.int32)) > 0
 
-        # Load V: [BLOCK_N, d_v]
-        v_ptrs = KV + kv_idx[:, None] * stride_kv_skv + offs_dv[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0)
+        if any_valid:
+            # Compute KV base pointers
+            kv_row_offs = kv_idx[:, None] * stride_kv_skv
 
-        # Compute Q @ K^T: [BLOCK_M, d_qk] @ [d_qk, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-        qk = tl.dot(q, tl.trans(k))
-        qk = qk.to(tl.float32) * sm_scale
+            # Load K and V
+            k_ptrs = KV + kv_row_offs + kv_d_offs
+            k = tl.load(k_ptrs, mask=valid[:, None], other=0.0)
 
-        # Mask invalid positions
-        qk = tl.where(valid[None, :], qk, float("-inf"))
+            v_ptrs = KV + kv_row_offs + kv_dv_offs
+            v = tl.load(v_ptrs, mask=valid[:, None], other=0.0)
 
-        # Online softmax
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
+            # Compute Q @ K^T
+            qk = tl.dot(q, tl.trans(k))
+            qk = qk.to(tl.float32) * sm_scale
 
-        # Rescale factor
-        alpha = tl.math.exp2((m_i - m_new) * LOG2E)
-        alpha = tl.where(m_i == float("-inf"), 1.0, alpha)
+            # Mask invalid positions
+            qk = tl.where(valid[None, :], qk, NEG_INF)
 
-        # Softmax numerator
-        p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
-        p = tl.where(qk == float("-inf"), 0.0, p)
+            # Online softmax
+            m_ij = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
 
-        # Update running sum
-        l_new = alpha * l_i + tl.sum(p, axis=1)
+            # Compute rescale factor - handle -inf case properly
+            # When m_i == -inf and m_new > -inf, alpha should be 0 (old values don't matter)
+            # When m_i > -inf and m_new > -inf, alpha = exp2((m_i - m_new) * LOG2E)
+            # When both are -inf, this block has no valid entries, skip
+            m_i_valid = m_i > NEG_INF
+            alpha = tl.where(m_i_valid, tl.math.exp2((m_i - m_new) * LOG2E), 0.0)
 
-        # Rescale accumulator
-        acc = acc * alpha[:, None]
+            # Softmax weights
+            p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
 
-        # Compute P @ V: [BLOCK_M, BLOCK_N] @ [BLOCK_N, d_v] -> [BLOCK_M, d_v]
-        pv = tl.dot(p.to(tl.bfloat16), v)
-        acc = acc + pv.to(tl.float32)
+            # Update running sum
+            l_new = alpha * l_i + tl.sum(p, axis=1)
 
-        # Update state
-        m_i = m_new
-        l_i = l_new
+            # Rescale and accumulate
+            acc = acc * alpha[:, None]
+            pv = tl.dot(p.to(tl.bfloat16), v)
+            acc = acc + pv.to(tl.float32)
+
+            # Update state
+            m_i = m_new
+            l_i = l_new
 
     # Store max_logits
     ml_ptrs = MaxLogits + pid_sq * stride_ml_sq + offs_m * stride_ml_hq
     tl.store(ml_ptrs, m_i, mask=mask_m)
 
     # Compute orig_lse
-    has_valid = l_i > 0
-    orig_lse = tl.where(has_valid, m_i + tl.log(l_i), float("-inf"))
+    has_valid = l_i > 0.0
+    orig_lse = tl.where(has_valid, m_i + tl.log(l_i), NEG_INF)
 
-    # Compute the LSE to use for output scaling
+    # Compute lse_for_o for output scaling
     if HAS_ATTN_SINK:
-        # Load attention sink for this head block
         sink_ptrs = AttnSink + offs_m
-        attn_sink = tl.load(sink_ptrs, mask=mask_m, other=float("-inf"))
+        attn_sink = tl.load(sink_ptrs, mask=mask_m, other=NEG_INF)
 
-        # Handle special cases for +inf and -inf
         sink_is_pos_inf = attn_sink == float("+inf")
-        sink_is_neg_inf = attn_sink == float("-inf")
-        orig_is_neg_inf = orig_lse == float("-inf")
+        sink_is_neg_inf = attn_sink == NEG_INF
+        orig_is_neg_inf = orig_lse == NEG_INF
 
-        # Compute logsumexp(orig_lse, attn_sink)
         max_lse = tl.maximum(orig_lse, attn_sink)
 
-        # Safe exp computation
         exp_orig = tl.where(orig_is_neg_inf | sink_is_pos_inf, 0.0,
                            tl.math.exp2((orig_lse - max_lse) * LOG2E))
-        exp_sink = tl.where(sink_is_neg_inf | sink_is_pos_inf, 0.0,
-                           tl.math.exp2((attn_sink - max_lse) * LOG2E))
-        exp_sink = tl.where(sink_is_pos_inf, 1.0, exp_sink)
+        exp_sink = tl.where(sink_is_neg_inf, 0.0,
+                   tl.where(sink_is_pos_inf, 1.0,
+                           tl.math.exp2((attn_sink - max_lse) * LOG2E)))
 
         sum_exp = exp_orig + exp_sink
 
-        # Compute lse_for_o
         lse_for_o = tl.where(sink_is_pos_inf, float("+inf"),
-                    tl.where(orig_is_neg_inf & sink_is_neg_inf, float("-inf"),
+                    tl.where(orig_is_neg_inf & sink_is_neg_inf, NEG_INF,
                             max_lse + tl.log(sum_exp)))
 
-        # Convert -inf to +inf for safe division
-        lse_for_o_safe = tl.where(lse_for_o == float("-inf"), float("+inf"), lse_for_o)
+        lse_for_o_safe = tl.where(lse_for_o == NEG_INF, float("+inf"), lse_for_o)
     else:
-        # No attention sink - use orig_lse
-        lse_for_o_safe = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
+        lse_for_o_safe = tl.where(orig_lse == NEG_INF, float("+inf"), orig_lse)
 
-    # Final rescale: acc contains sum(exp(qk - m_i) * V)
-    # We need: sum(exp(qk - lse_for_o) * V) = acc * exp(m_i - lse_for_o)
+    # Final rescale - handle case where has_valid is False
     scale = tl.where(has_valid, tl.math.exp2((m_i - lse_for_o_safe) * LOG2E), 0.0)
     acc = acc * scale[:, None]
 
-    # Store LSE (original LSE, not the combined one)
-    final_lse = tl.where(orig_lse == float("-inf"), float("+inf"), orig_lse)
+    # Store LSE
+    final_lse = tl.where(orig_lse == NEG_INF, float("+inf"), orig_lse)
     lse_ptrs = LSE + pid_sq * stride_lse_sq + offs_m * stride_lse_hq
     tl.store(lse_ptrs, final_lse, mask=mask_m)
 
@@ -211,7 +225,7 @@ def triton_sparse_attn_fwd_optimized(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Optimized sparse attention with tensor core utilization and fused attention sink.
+    Optimized sparse attention with reduced control flow overhead.
     """
     s_q, h_q, d_qk = q.shape
 
@@ -230,17 +244,20 @@ def triton_sparse_attn_fwd_optimized(
         indices_2d = indices_2d.clone()
         indices_2d[mask] = -1
 
+    # Pre-compute invalid mask including bounds check
     invalid_mask = (indices_2d < 0) | (indices_2d >= s_kv)
+
+    # Clamp indices to valid range for safe memory access
+    indices_clamped = indices_2d.clamp(0, max(0, s_kv - 1))
 
     out_fp32 = torch.empty((s_q, h_q, d_v), dtype=torch.float32, device=q.device)
     max_logits = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
     lse = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
 
     q_contig = q.contiguous()
-    indices_contig = indices_2d.contiguous()
+    indices_contig = indices_clamped.contiguous()
     invalid_mask_contig = invalid_mask.contiguous()
 
-    # Prepare attention sink
     has_attn_sink = attn_sink is not None
     if has_attn_sink:
         attn_sink_contig = attn_sink.contiguous().to(torch.float32)
@@ -250,7 +267,7 @@ def triton_sparse_attn_fwd_optimized(
     def grid_fn(meta):
         return (s_q, triton.cdiv(h_q, meta['BLOCK_M']))
 
-    _sparse_attn_fwd_fused[grid_fn](
+    _sparse_attn_fwd_v8[grid_fn](
         q_contig, kv_2d, indices_contig, invalid_mask_contig,
         attn_sink_contig,
         out_fp32, max_logits, lse,
