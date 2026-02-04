@@ -1,5 +1,5 @@
 """
-Optimized Triton implementation of MLA sparse attention prefill kernel - Version 8.
+Optimized Triton implementation of MLA sparse attention prefill kernel - Version 9.
 
 Key optimizations:
 1. Use tl.dot with proper BF16 inputs for tensor core acceleration
@@ -8,12 +8,15 @@ Key optimizations:
 4. Keep Q in registers, stream KV through
 5. In-kernel vectorized KV gathering - eliminates expensive pre-gathering
 6. Fused attention sink computation - eliminates separate post-processing pass
-7. **NEW: Reduced control flow overhead**
+7. Reduced control flow overhead
    - Pre-compute base pointers outside the loop
-   - Use clamped indices for safe memory access (bounds check moved to Python)
    - Simplified valid mask computation
    - Use predicated execution where possible
    - Fixed NaN handling for edge cases (all invalid indices)
+8. **NEW: Fused topk_length masking with single index load**
+   - Only load original indices (no separate mask tensor)
+   - Compute validity and clamped indices in-kernel
+   - Reduces memory bandwidth
 
 Matmul precision:
 - Q @ K^T and P @ V are computed in BF16 for tensor core acceleration
@@ -46,8 +49,8 @@ LOG2E = 1.4426950408889634
     key=['h_q', 'topk', 'd_qk'],
 )
 @triton.jit
-def _sparse_attn_fwd_v8(
-    Q, KV, Indices, InvalidMask,
+def _sparse_attn_fwd_v9(
+    Q, KV, Indices,
     AttnSink,
     Out, MaxLogits, LSE,
     sm_scale,
@@ -55,7 +58,6 @@ def _sparse_attn_fwd_v8(
     stride_q_sq, stride_q_hq, stride_q_d,
     stride_kv_skv, stride_kv_d,
     stride_idx_sq, stride_idx_topk,
-    stride_mask_sq, stride_mask_topk,
     stride_o_sq, stride_o_hq, stride_o_d,
     stride_ml_sq, stride_ml_hq,
     stride_lse_sq, stride_lse_hq,
@@ -64,7 +66,11 @@ def _sparse_attn_fwd_v8(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Sparse attention with reduced control flow overhead.
+    Sparse attention with fused topk_length masking.
+
+    Only loads the original indices tensor. Validity is determined by checking
+    if index is in valid range [0, s_kv). Invalid indices are clamped in-kernel
+    for safe memory access.
 
     Grid: (s_q, cdiv(h_q, BLOCK_M))
     """
@@ -88,7 +94,6 @@ def _sparse_attn_fwd_v8(
     # Pre-compute base pointers
     q_base = Q + pid_sq * stride_q_sq
     idx_base = Indices + pid_sq * stride_idx_sq
-    mask_base = InvalidMask + pid_sq * stride_mask_sq
 
     # Load Q once
     q_ptrs = q_base + offs_m[:, None] * stride_q_hq + offs_d[None, :] * stride_q_d
@@ -108,21 +113,20 @@ def _sparse_attn_fwd_v8(
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < topk
 
-        # Load indices
+        # Load indices (may contain invalid values like -1 or OOB)
         idx_ptrs = idx_base + offs_n * stride_idx_topk
-        kv_idx = tl.load(idx_ptrs, mask=mask_n, other=0)
+        raw_idx = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        # Load invalid mask
-        inv_ptrs = mask_base + offs_n * stride_mask_topk
-        invalid = tl.load(inv_ptrs, mask=mask_n, other=True)
-
-        # Valid mask
-        valid = (~invalid) & mask_n
+        # Compute valid mask: index must be in valid range [0, s_kv)
+        valid = mask_n & (raw_idx >= 0) & (raw_idx < s_kv)
 
         # Check if any valid in this block
         any_valid = tl.sum(valid.to(tl.int32)) > 0
 
         if any_valid:
+            # Clamp indices for safe memory access (invalid ones will be masked anyway)
+            kv_idx = tl.where(valid, raw_idx, 0)
+
             # Compute KV base pointers
             kv_row_offs = kv_idx[:, None] * stride_kv_skv
 
@@ -145,9 +149,6 @@ def _sparse_attn_fwd_v8(
             m_new = tl.maximum(m_i, m_ij)
 
             # Compute rescale factor - handle -inf case properly
-            # When m_i == -inf and m_new > -inf, alpha should be 0 (old values don't matter)
-            # When m_i > -inf and m_new > -inf, alpha = exp2((m_i - m_new) * LOG2E)
-            # When both are -inf, this block has no valid entries, skip
             m_i_valid = m_i > NEG_INF
             alpha = tl.where(m_i_valid, tl.math.exp2((m_i - m_new) * LOG2E), 0.0)
 
@@ -201,7 +202,7 @@ def _sparse_attn_fwd_v8(
     else:
         lse_for_o_safe = tl.where(orig_lse == NEG_INF, float("+inf"), orig_lse)
 
-    # Final rescale - handle case where has_valid is False
+    # Final rescale
     scale = tl.where(has_valid, tl.math.exp2((m_i - lse_for_o_safe) * LOG2E), 0.0)
     acc = acc * scale[:, None]
 
@@ -225,7 +226,10 @@ def triton_sparse_attn_fwd_optimized(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Optimized sparse attention with reduced control flow overhead.
+    Optimized sparse attention with fused topk_length masking.
+
+    Only passes the indices tensor to the kernel. Invalid indices are marked
+    with -1 and the kernel determines validity by checking the index range.
     """
     s_q, h_q, d_qk = q.shape
 
@@ -237,26 +241,22 @@ def triton_sparse_attn_fwd_optimized(
         kv_2d = kv.contiguous()
 
     topk = indices.shape[2]
-    indices_2d = indices.squeeze(1).contiguous()
+    indices_2d = indices.squeeze(1)
 
+    # Handle topk_length by setting invalid indices to -1
     if topk_length is not None:
         mask = torch.arange(topk, device=topk_length.device).unsqueeze(0) >= topk_length.unsqueeze(1)
         indices_2d = indices_2d.clone()
         indices_2d[mask] = -1
 
-    # Pre-compute invalid mask including bounds check
-    invalid_mask = (indices_2d < 0) | (indices_2d >= s_kv)
-
-    # Clamp indices to valid range for safe memory access
-    indices_clamped = indices_2d.clamp(0, max(0, s_kv - 1))
+    # Pass indices directly - kernel will check validity and clamp
+    indices_contig = indices_2d.contiguous()
 
     out_fp32 = torch.empty((s_q, h_q, d_v), dtype=torch.float32, device=q.device)
     max_logits = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
     lse = torch.empty((s_q, h_q), dtype=torch.float32, device=q.device)
 
     q_contig = q.contiguous()
-    indices_contig = indices_clamped.contiguous()
-    invalid_mask_contig = invalid_mask.contiguous()
 
     has_attn_sink = attn_sink is not None
     if has_attn_sink:
@@ -267,8 +267,8 @@ def triton_sparse_attn_fwd_optimized(
     def grid_fn(meta):
         return (s_q, triton.cdiv(h_q, meta['BLOCK_M']))
 
-    _sparse_attn_fwd_v8[grid_fn](
-        q_contig, kv_2d, indices_contig, invalid_mask_contig,
+    _sparse_attn_fwd_v9[grid_fn](
+        q_contig, kv_2d, indices_contig,
         attn_sink_contig,
         out_fp32, max_logits, lse,
         sm_scale,
@@ -276,7 +276,6 @@ def triton_sparse_attn_fwd_optimized(
         q_contig.stride(0), q_contig.stride(1), q_contig.stride(2),
         kv_2d.stride(0), kv_2d.stride(1),
         indices_contig.stride(0), indices_contig.stride(1),
-        invalid_mask_contig.stride(0), invalid_mask_contig.stride(1),
         out_fp32.stride(0), out_fp32.stride(1), out_fp32.stride(2),
         max_logits.stride(0), max_logits.stride(1),
         lse.stride(0), lse.stride(1),
