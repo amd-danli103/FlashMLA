@@ -6,6 +6,10 @@ Key optimization over V10:
 - Handle all-invalid cases through careful masking instead
 
 This should recover the performance lost due to the branching overhead.
+
+Version 11.1 Update:
+- Added s_q_bucket to autotune key to select optimal config for different s_q sizes
+- This fixes the issue where autotune on small s_q selects suboptimal config for large s_q
 """
 
 import torch
@@ -14,6 +18,30 @@ import triton.language as tl
 from typing import Optional, Tuple
 
 LOG2E = 1.4426950408889634
+
+
+def get_s_q_bucket(s_q: int) -> int:
+    """
+    Bucket s_q into categories for autotune key.
+    This ensures autotune runs separately for small vs large s_q.
+
+    Buckets:
+    - 0: s_q <= 64 (very small)
+    - 1: 64 < s_q <= 256 (small)
+    - 2: 256 < s_q <= 1024 (medium)
+    - 3: 1024 < s_q <= 4096 (large)
+    - 4: s_q > 4096 (very large)
+    """
+    if s_q <= 64:
+        return 0
+    elif s_q <= 256:
+        return 1
+    elif s_q <= 1024:
+        return 2
+    elif s_q <= 4096:
+        return 3
+    else:
+        return 4
 
 
 @triton.autotune(
@@ -34,7 +62,7 @@ LOG2E = 1.4426950408889634
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_D': 128}, num_warps=4, num_stages=2),
     ],
-    key=['h_q', 'topk', 'd_qk'],
+    key=['s_q_bucket', 'h_q', 'topk', 'd_qk'],
 )
 @triton.jit
 def _sparse_attn_fwd_v11(
@@ -42,7 +70,7 @@ def _sparse_attn_fwd_v11(
     AttnSink,
     Out, MaxLogits, LSE,
     sm_scale,
-    s_q, h_q, topk, d_qk: tl.constexpr, d_v: tl.constexpr, s_kv,
+    s_q, s_q_bucket, h_q, topk, d_qk: tl.constexpr, d_v: tl.constexpr, s_kv,
     stride_q_sq, stride_q_hq, stride_q_d,
     stride_kv_skv, stride_kv_d,
     stride_idx_sq, stride_idx_topk,
@@ -227,6 +255,9 @@ def triton_sparse_attn_fwd_optimized(
     else:
         attn_sink_contig = torch.empty(h_q, dtype=torch.float32, device=q.device)
 
+    # Compute s_q bucket for autotune key
+    s_q_bucket = get_s_q_bucket(s_q)
+
     def grid_fn(meta):
         return (s_q, triton.cdiv(h_q, meta['BLOCK_M']))
 
@@ -235,7 +266,7 @@ def triton_sparse_attn_fwd_optimized(
         attn_sink_contig,
         out_fp32, max_logits, lse,
         sm_scale,
-        s_q, h_q, topk, d_qk, d_v, s_kv,
+        s_q, s_q_bucket, h_q, topk, d_qk, d_v, s_kv,
         q_contig.stride(0), q_contig.stride(1), q_contig.stride(2),
         kv_2d.stride(0), kv_2d.stride(1),
         indices_contig.stride(0), indices_contig.stride(1),
