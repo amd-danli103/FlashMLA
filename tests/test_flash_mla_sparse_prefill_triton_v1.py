@@ -7,7 +7,7 @@ import kernelkit as kk
 from lib import TestParam
 import lib
 import ref
-# from triton_mla_kernels import triton_sparse_attn_fwd as triton_sparse_attn_fwd
+# Use optimized Triton implementation instead of the original
 from triton_mla_kernels_optimized import triton_sparse_attn_fwd_optimized as triton_sparse_attn_fwd
 
 _counter = kk.Counter()
@@ -75,38 +75,44 @@ if __name__ == '__main__':
     correctness_cases = [
         # Regular shapes
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, d_qk=d_qk)
-        for d_qk in [512]
+        for d_qk in [512, 576]
         for h_q in [
-            128, 64]
+            128, 64
+        ]
         for s_kv, topk in [
             # Regular shapes
             (128, 128),
             (256, 256),
             (512, 512),
+
             # Irregular shapes
             (592, 128),
             (1840, 256),
             (1592, 384),
             (1521, 512),
+
             # Irregular shapes with OOB TopK
             (95, 128),
             (153, 256),
             (114, 384),
         ]
         for s_q in [
-            1, 62, 213]
+            1, 62, 213
+        ]
     ]
 
     correctness_cases_with_features = [
         TestParam(s_q, s_kv, topk, h_q=h_q, num_runs=0, have_attn_sink=have_attn_sink, have_topk_length=have_topk_length, d_qk=d_qk)
-        for d_qk in [512]
+        for d_qk in [512, 576]
         for h_q in [
-            128, 64]
+            128, 64
+        ]
         for s_kv, topk in [
             (592, 128),
             (1840, 256),
             (1592, 384),
             (1521, 512),
+
             (95, 128),
             (153, 256),
             (114, 384),
@@ -117,48 +123,44 @@ if __name__ == '__main__':
         for have_topk_length in [False, True]
     ]
 
-    # Corner cases - 移除了6个无法通过的极端测试用例
-    # 移除的用例：
-    # - (1234, 4321, 4096) - gathered_kv 张量约 5.2GB，超出处理能力
-    # - (4096, 2048, 2048) - gathered_kv 张量约 8.6GB，超出处理能力  
-    # - (1024, 64, 8192) - gathered_kv 张量约 8.6GB，超出处理能力
     corner_cases = [
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=True, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
-        for d_qk in [512]
+        for d_qk in [512, 576]
         for h_q in [
-            128, 64]
+            128, 64
+        ]
         for s_q, s_kv, topk in [
             (1, 128, 128),
             (1, 256, 256),
-            # 移除: (1234, 4321, 4096) - 内存过大
-            # 移除: (4096, 2048, 2048) - 内存过大
+            (1234, 4321, 4096),
+            (4096, 2048, 2048)
         ]
     ] + [
         # In these cases, some blocks may not have any valid topk indices
         TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
-        for d_qk in [512]
+        for d_qk in [512, 576]
         for h_q in [
-            128, 64]
+            128, 64
+        ]
         for s_kv, topk in [
             (32, 2048),
-            # 移除: (64, 8192) 当 s_q=1024 时内存过大
+            (64, 8192)
         ]
         for s_q in [1, 1024]
     ] + [
-        # 保留 s_q=1 的 topk=8192 测试
-        TestParam(s_q, s_kv, topk, h_q=h_q, is_all_indices_invalid=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
-        for d_qk in [512]
-        for h_q in [
-            128, 64]
-        for s_kv, topk in [(64, 8192)]
-        for s_q in [1]  # 只保留 s_q=1
-    ] + [
+        # In this testcase, s_q is really large, so we cannot put it on the second dimension of grid shape
+        # Note: Using s_q=8192 instead of 70000 for optimized kernel due to memory constraints
+        # (70000 * 128 * 512 * 6 bytes for dual output = ~27GB which exceeds GPU memory)
         TestParam(8192, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
-        for d_qk in [512]
-        for h_q in [128, 64]
+        for d_qk in [512, 576]
+        for h_q in [
+            128, 64
+        ]
     ]
 
     performance_case_templates = [
+        # V3.2
+        (576, 128, 2048, [8192, 32768, 65536, 98304, 131072]),
         # MODEL1 CONFIG1
         (512, 64, 512, [8192, 32768, 49152, 65536]),
         # MODEL1 CONFIG2
