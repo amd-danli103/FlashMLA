@@ -8,7 +8,7 @@ from lib import TestParam
 import lib
 import ref
 # Use optimized Triton implementation instead of the original
-from triton_mla_kernels_optimized import triton_sparse_attn_fwd_optimized as triton_sparse_attn_fwd
+from triton_mla_kernels_prefill_optimized import triton_sparse_attn_fwd_optimized as triton_sparse_attn_fwd
 
 _counter = kk.Counter()
 
