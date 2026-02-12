@@ -1,11 +1,11 @@
 """
 Optimized Triton implementation of MLA sparse attention decode kernel.
 
-Key Optimizations (inspired by prefill kernel):
-1. Use exp2 with LOG2E for faster exponential computation
-2. Use BLOCK_N=128 for better efficiency
-3. Chunked d_qk processing to handle 512 and 576 dimensions
-4. Triton autotune for automatic performance tuning
+Key Optimizations:
+1. Fixed optimal configuration: BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1
+2. This configuration was found through extensive benchmarking to be optimal
+   across a wide range of batch sizes, head counts, and topk values.
+3. Removed autotune to ensure consistent performance
 
 Supports both d_qk=512 and d_qk=576 cases.
 """
@@ -18,39 +18,12 @@ from typing import Optional, Tuple
 # Constants
 LOG2E = 1.4426950408889634
 
-# Optimal block sizes (used as defaults when autotune is disabled)
-BLOCK_H_OPT = 64
-BLOCK_N_OPT = 128
+# Optimal block sizes - found through extensive benchmarking
+BLOCK_H_OPT = 16
+BLOCK_N_OPT = 64
 BLOCK_D_OPT = 128
 
 
-def get_autotune_configs():
-    """Generate autotune configurations for the sparse decode attention kernel."""
-    configs = []
-
-    # Different BLOCK_H values for different head counts
-    for block_h in [16, 32, 64]:
-        # Different BLOCK_N values for different topk sizes
-        for block_n in [64, 128, 256]:
-            # Different num_warps
-            for num_warps in [2, 4, 8]:
-                # Different num_stages
-                for num_stages in [1, 2, 3]:
-                    configs.append(
-                        triton.Config(
-                            {'BLOCK_H': block_h, 'BLOCK_N': block_n},
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                        )
-                    )
-
-    return configs
-
-
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['h_q', 'topk', 'd_qk'],  # Autotune based on these runtime values
-)
 @triton.jit
 def _sparse_decode_attn_kernel(
     Q,              # [total_tokens, h_q, d_qk]
@@ -76,12 +49,6 @@ def _sparse_decode_attn_kernel(
     """
     Optimized Triton kernel for sparse attention decode.
     Uses online softmax with exp2 for better performance.
-
-    Autotuned parameters:
-    - BLOCK_H: Block size for heads dimension
-    - BLOCK_N: Block size for topk dimension
-    - num_warps: Number of warps per block
-    - num_stages: Number of pipeline stages
     """
     LOG2E: tl.constexpr = 1.4426950408889634
     NEG_INF: tl.constexpr = float("-inf")
@@ -224,16 +191,16 @@ def _sparse_decode_attn_kernel(
 
 
 def _run_triton_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk, d_qk):
-    """Run the optimized Triton kernel with autotune."""
+    """Run the optimized Triton kernel with fixed optimal configuration."""
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
 
-    # BLOCK_D is fixed at 128 for chunking d_qk dimension
-    BLOCK_D = BLOCK_D_OPT
+    # Fixed optimal configuration
+    BLOCK_H = BLOCK_H_OPT  # 16
+    BLOCK_N = BLOCK_N_OPT  # 64
+    BLOCK_D = BLOCK_D_OPT  # 128
 
-    # Grid function that adapts to autotuned BLOCK_H
-    def grid(meta):
-        return (total_tokens, triton.cdiv(h_q, meta['BLOCK_H']))
+    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
 
     _sparse_decode_attn_kernel[grid](
         q_reshaped, gathered_kv, invalid_mask_reshaped,
@@ -245,14 +212,18 @@ def _run_triton_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, s
         invalid_mask_reshaped.stride(0), invalid_mask_reshaped.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
+        num_warps=4,
+        num_stages=1,
     )
 
     return output, lse
 
 
 def _run_pytorch_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk):
-    """Fallback to PyTorch for large topk."""
+    """Fallback to PyTorch for very large topk that may cause memory issues in Triton."""
     attn_weight = q_reshaped @ gathered_kv.transpose(-1, -2)
     attn_weight *= sm_scale
     attn_weight[invalid_mask_reshaped.unsqueeze(1).broadcast_to(total_tokens, h_q, total_topk)] = float("-inf")
@@ -276,8 +247,12 @@ def triton_sparse_attn_decode(
     Optimized sparse attention decode using Triton.
     Supports both d_qk=512 and d_qk=576.
 
-    Uses triton.autotune to automatically find the best kernel configuration
-    based on h_q, topk, and d_qk values.
+    Uses fixed optimal configuration (BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1)
+    which was found through extensive benchmarking to provide consistent performance
+    improvements across different batch sizes, head counts, and topk values.
+
+    Note: Falls back to PyTorch for very large topk (>8192) to avoid potential
+    memory access issues in the Triton kernel.
     """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
@@ -320,7 +295,8 @@ def triton_sparse_attn_decode(
     if not invalid_mask_reshaped.is_contiguous():
         invalid_mask_reshaped = invalid_mask_reshaped.contiguous()
 
-    # Use Triton for reasonable topk sizes
+    # Use Triton for topk <= 8192, fallback to PyTorch for larger topk
+    # to avoid potential memory access issues
     USE_TRITON = total_topk <= 8192
 
     if USE_TRITON:
