@@ -2,10 +2,9 @@
 Optimized Triton implementation of MLA sparse attention decode kernel.
 
 Key Optimizations:
-1. Fixed optimal configuration: BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1
-2. This configuration was found through extensive benchmarking to be optimal
-   across a wide range of batch sizes, head counts, and topk values.
-3. Removed autotune to ensure consistent performance
+1. Fused attn_sink and lonely_q masking into the kernel
+2. Reduced post-processing overhead
+3. Fixed optimal configuration: BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1
 
 Supports both d_qk=512 and d_qk=576 cases.
 """
@@ -25,10 +24,11 @@ BLOCK_D_OPT = 128
 
 
 @triton.jit
-def _sparse_decode_attn_kernel(
+def _sparse_decode_attn_kernel_fused(
     Q,              # [total_tokens, h_q, d_qk]
     KV,             # [total_tokens, topk, d_qk]
     InvalidMask,    # [total_tokens, topk]
+    AttnSink,       # [h_q] or None
     Output,         # [total_tokens, h_q, d_v]
     LSE,            # [total_tokens, h_q]
     sm_scale,
@@ -42,16 +42,18 @@ def _sparse_decode_attn_kernel(
     stride_mask_t, stride_mask_k,
     stride_o_t, stride_o_h, stride_o_d,
     stride_lse_t, stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """
-    Optimized Triton kernel for sparse attention decode.
-    Uses online softmax with exp2 for better performance.
+    Optimized Triton kernel for sparse attention decode with fused post-processing.
+    Fuses attn_sink scaling and lonely_q masking into the kernel.
     """
     LOG2E: tl.constexpr = 1.4426950408889634
     NEG_INF: tl.constexpr = float("-inf")
+    POS_INF: tl.constexpr = float("inf")
 
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -148,23 +150,50 @@ def _sparse_decode_attn_kernel(
         m_i = m_new
         l_i = l_new
 
-    # Finalize: normalize by l_i
-    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    acc_0 = acc_0 / l_safe[:, None]
-    acc_1 = acc_1 / l_safe[:, None]
-    acc_2 = acc_2 / l_safe[:, None]
-    acc_3 = acc_3 / l_safe[:, None]
-
-    # Zero out if all invalid
-    zero_mask = l_i[:, None] == 0.0
-    acc_0 = tl.where(zero_mask, 0.0, acc_0)
-    acc_1 = tl.where(zero_mask, 0.0, acc_1)
-    acc_2 = tl.where(zero_mask, 0.0, acc_2)
-    acc_3 = tl.where(zero_mask, 0.0, acc_3)
-
-    # Compute LSE using log2 for consistency with exp2
+    # Compute LSE: lse = m + log(l)
+    # Using log2 for consistency with exp2
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
-    lse = tl.where(l_i == 0.0, NEG_INF, lse)
+
+    # Check for lonely_q (all invalid tokens -> l_i == 0)
+    is_lonely_q = (l_i == 0.0)
+
+    # Compute output scale factor
+    # If has attn_sink: scale = 1 / (1 + exp(attn_sink - lse)) = 1 / (l + exp(attn_sink - m))
+    # If lonely_q: output = 0, lse = +inf
+    if HAS_ATTN_SINK:
+        # Load attn_sink values
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        # scale = 1 / (l + exp(attn_sink - m))
+        # But we need to be careful with the math here
+        # lse = m + log(l)
+        # We want: output *= 1 / (1 + exp(attn_sink - lse))
+        #        = 1 / (1 + exp(attn_sink - m - log(l)))
+        #        = 1 / (1 + exp(attn_sink - m) / l)
+        #        = l / (l + exp(attn_sink - m))
+        # So final_scale = 1 / (l + exp(attn_sink - m))
+        exp_attn_sink_minus_m = tl.math.exp2((attn_sink_vals - m_i) * LOG2E)
+        denominator = l_i + exp_attn_sink_minus_m
+        # Avoid division by zero
+        denominator = tl.where(denominator == 0.0, 1.0, denominator)
+        output_scale = 1.0 / denominator
+    else:
+        # Just normalize by l_i
+        output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
+
+    # Apply scale to accumulators
+    acc_0 = acc_0 * output_scale[:, None]
+    acc_1 = acc_1 * output_scale[:, None]
+    acc_2 = acc_2 * output_scale[:, None]
+    acc_3 = acc_3 * output_scale[:, None]
+
+    # Zero out if lonely_q
+    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0)
+    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1)
+    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2)
+    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3)
+
+    # Set lse to +inf for lonely_q
+    lse = tl.where(is_lonely_q, POS_INF, lse)
 
     # Store LSE
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
@@ -190,8 +219,9 @@ def _sparse_decode_attn_kernel(
     tl.store(o_ptrs, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
 
 
-def _run_triton_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk, d_qk):
-    """Run the optimized Triton kernel with fixed optimal configuration."""
+def _run_triton_attention_fused(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale,
+                                 total_tokens, h_q, total_topk, d_qk, attn_sink=None):
+    """Run the optimized Triton kernel with fused post-processing."""
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
 
@@ -202,8 +232,17 @@ def _run_triton_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, s
 
     grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
 
-    _sparse_decode_attn_kernel[grid](
+    HAS_ATTN_SINK = attn_sink is not None
+
+    # Create a dummy tensor if attn_sink is None
+    if attn_sink is None:
+        attn_sink_tensor = torch.empty(1, device=q_reshaped.device, dtype=torch.float32)
+    else:
+        attn_sink_tensor = attn_sink
+
+    _sparse_decode_attn_kernel_fused[grid](
         q_reshaped, gathered_kv, invalid_mask_reshaped,
+        attn_sink_tensor,
         output, lse,
         sm_scale,
         total_tokens, h_q, total_topk, d_qk, d_v,
@@ -212,6 +251,7 @@ def _run_triton_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, s
         invalid_mask_reshaped.stride(0), invalid_mask_reshaped.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
+        HAS_ATTN_SINK=HAS_ATTN_SINK,
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
@@ -244,15 +284,11 @@ def triton_sparse_attn_decode(
     attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimized sparse attention decode using Triton.
+    Optimized sparse attention decode using Triton with fused post-processing.
     Supports both d_qk=512 and d_qk=576.
 
-    Uses fixed optimal configuration (BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1)
-    which was found through extensive benchmarking to provide consistent performance
-    improvements across different batch sizes, head counts, and topk values.
-
-    Note: Falls back to PyTorch for very large topk (>8192) to avoid potential
-    memory access issues in the Triton kernel.
+    Key optimization: attn_sink scaling and lonely_q masking are fused into the kernel,
+    reducing post-processing overhead.
     """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
@@ -296,30 +332,37 @@ def triton_sparse_attn_decode(
         invalid_mask_reshaped = invalid_mask_reshaped.contiguous()
 
     # Use Triton for topk <= 8192, fallback to PyTorch for larger topk
-    # to avoid potential memory access issues
     USE_TRITON = total_topk <= 8192
 
     if USE_TRITON:
-        output, lse = _run_triton_attention(
+        # Pass attn_sink to the fused kernel
+        output, lse = _run_triton_attention_fused(
             q_reshaped, gathered_kv, invalid_mask_reshaped, 
-            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk
+            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+            attn_sink=attn_sink
         )
     else:
         output, lse = _run_pytorch_attention(
             q_reshaped, gathered_kv, invalid_mask_reshaped,
             d_v, sm_scale, total_tokens, h_q, total_topk
         )
+        # For PyTorch path, still need to do post-processing
+        output = output.view(b, s_q, h_q, d_v)
+        lse = lse.view(b, s_q, h_q)
 
+        if attn_sink is not None:
+            output = output.float()
+            output *= (1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))).unsqueeze(-1)
+            output = output.to(torch.bfloat16)
+
+        lonely_q_mask = (lse == float("-inf"))
+        output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
+        lse[lonely_q_mask] = float("+inf")
+
+        return output, lse.transpose(1, 2)
+
+    # For Triton path, post-processing is already done in the kernel
     output = output.view(b, s_q, h_q, d_v)
     lse = lse.view(b, s_q, h_q)
-
-    if attn_sink is not None:
-        output = output.float()
-        output *= (1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))).unsqueeze(-1)
-        output = output.to(torch.bfloat16)
-
-    lonely_q_mask = (lse == float("-inf"))
-    output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
-    lse[lonely_q_mask] = float("+inf")
 
     return output, lse.transpose(1, 2)
