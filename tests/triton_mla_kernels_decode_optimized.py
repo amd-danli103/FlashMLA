@@ -5,6 +5,7 @@ Key Optimizations:
 1. Fused attn_sink and lonely_q masking into the kernel
 2. Reduced post-processing overhead
 3. Fixed optimal configuration: BLOCK_H=16, BLOCK_N=64, num_warps=4, num_stages=1
+4. Use bfloat16 for matrix multiplications to leverage tensor cores
 
 Supports both d_qk=512 and d_qk=576 cases.
 """
@@ -50,6 +51,7 @@ def _sparse_decode_attn_kernel_fused(
     """
     Optimized Triton kernel for sparse attention decode with fused post-processing.
     Fuses attn_sink scaling and lonely_q masking into the kernel.
+    Uses bfloat16 for matrix multiplications to leverage tensor cores.
     """
     LOG2E: tl.constexpr = 1.4426950408889634
     NEG_INF: tl.constexpr = float("-inf")
@@ -64,11 +66,11 @@ def _sparse_decode_attn_kernel_fused(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offs_h < h_q
 
-    # Initialize online softmax state
+    # Initialize online softmax state (keep in float32 for numerical stability)
     m_i = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
 
-    # Accumulators for output - 4 chunks for d_v=512
+    # Accumulators for output - 4 chunks for d_v=512 (keep in float32 for accumulation)
     acc_0 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     acc_1 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     acc_2 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
@@ -88,7 +90,7 @@ def _sparse_decode_attn_kernel_fused(
         invalid = tl.load(mask_ptrs, mask=mask_n, other=True)
         valid = mask_n & ~invalid
 
-        # Compute Q @ K^T in chunks
+        # Compute Q @ K^T in chunks using bfloat16 for tensor core acceleration
         qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
         # Process d_qk in chunks of BLOCK_D
@@ -96,16 +98,16 @@ def _sparse_decode_attn_kernel_fused(
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < d_qk
 
-            # Load Q chunk
+            # Load Q chunk in bfloat16
             q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
-            q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
 
-            # Load K chunk
+            # Load K chunk in bfloat16
             k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
-            k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
 
-            # Accumulate dot product
-            qk += tl.dot(q_chunk, tl.trans(k_chunk))
+            # Accumulate dot product (tensor core accelerated with bf16)
+            qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
 
         # Scale and mask
         qk = qk * sm_scale
@@ -120,32 +122,32 @@ def _sparse_decode_attn_kernel_fused(
 
         l_new = alpha * l_i + tl.sum(p, axis=1)
 
-        # Load V and accumulate P @ V for each chunk
-        p_f32 = p.to(tl.float32)
+        # Convert p to bfloat16 for P @ V multiplication (tensor core accelerated)
+        p_bf16 = p.to(tl.bfloat16)
 
         # V chunk 0
         offs_v = tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_f32, v)
+        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
+        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         # V chunk 1
         offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.float32)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_f32, v)
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         # V chunk 2
         offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.float32)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_f32, v)
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         # V chunk 3
         offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.float32)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_f32, v)
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         m_i = m_new
         l_i = l_new
@@ -288,7 +290,7 @@ def triton_sparse_attn_decode(
     Supports both d_qk=512 and d_qk=576.
 
     Key optimization: attn_sink scaling and lonely_q masking are fused into the kernel,
-    reducing post-processing overhead.
+    reducing post-processing overhead. Uses bfloat16 for matrix multiplications.
     """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
@@ -318,11 +320,13 @@ def triton_sparse_attn_decode(
     total_topk = gathered_kv.shape[2]
     total_tokens = b * s_q
 
-    gathered_kv = gathered_kv.view(total_tokens, total_topk, d_qk).float()
-    gathered_kv[gathered_kv != gathered_kv] = 0.0
+    # Keep data in bfloat16 for tensor core acceleration
+    gathered_kv = gathered_kv.reshape(total_tokens, total_topk, d_qk).to(torch.bfloat16)
+    # Handle NaN values
+    gathered_kv = torch.where(gathered_kv != gathered_kv, torch.zeros_like(gathered_kv), gathered_kv)
 
-    q_reshaped = q.float().view(total_tokens, h_q, d_qk)
-    invalid_mask_reshaped = invalid_mask.view(total_tokens, total_topk)
+    q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
+    invalid_mask_reshaped = invalid_mask.reshape(total_tokens, total_topk)
 
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
@@ -342,8 +346,11 @@ def triton_sparse_attn_decode(
             attn_sink=attn_sink
         )
     else:
+        # For PyTorch path, convert to float for computation
+        q_reshaped_f32 = q_reshaped.float()
+        gathered_kv_f32 = gathered_kv.float()
         output, lse = _run_pytorch_attention(
-            q_reshaped, gathered_kv, invalid_mask_reshaped,
+            q_reshaped_f32, gathered_kv_f32, invalid_mask_reshaped,
             d_v, sm_scale, total_tokens, h_q, total_topk
         )
         # For PyTorch path, still need to do post-processing
