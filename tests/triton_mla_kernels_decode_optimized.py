@@ -3,25 +3,19 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
-# Constants
 LOG2E = tl.constexpr(1.4426950408889634)
-
-# Optimal block sizes
 BLOCK_H_OPT = 16
 BLOCK_N_OPT = 64
 BLOCK_D_OPT = 128
 
 
 def gather_dequant_fp8_v32(
-    kv_cache_quantized: torch.Tensor,  # [num_blocks, block_size, 1, bytes_per_token]
-    indices: torch.Tensor,              # [total_tokens, topk] - flattened indices
-    invalid_mask: torch.Tensor,         # [total_tokens, topk]
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    invalid_mask: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """
-    Gather and dequantize FP8 KV cache to BF16 for V32 layout (d_qk=576).
-    OPTIMIZED: Avoid reshape by computing block_idx and offset_in_block directly.
-    """
+    """V32 layout gather+dequant."""
     d_qk = 576
     d_nope = 512
     d_rope = 64
@@ -31,68 +25,40 @@ def gather_dequant_fp8_v32(
 
     total_tokens, topk = indices.shape
     device = kv_cache_quantized.device
+    num_blocks = kv_cache_quantized.shape[0]
 
-    # Clamp invalid indices to 0
     indices_clamped = torch.clamp(indices, min=0)
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
 
-    # Compute block_idx and offset_in_block directly (AVOIDS RESHAPE!)
-    block_idx = indices_clamped // block_size  # [total_tokens, topk]
-    offset_in_block = indices_clamped % block_size  # [total_tokens, topk]
+    kv_per_block = kv_cache_quantized.view(num_blocks, block_size, bytes_per_token)
+    flat_block_idx = block_idx.view(-1)
+    flat_offset = offset_in_block.view(-1)
 
-    # Gather using advanced indexing without reshape
-    # kv_cache_quantized shape: [num_blocks, block_size, 1, bytes_per_token]
-    # We want to gather [total_tokens, topk, bytes_per_token]
-    gathered_bytes = kv_cache_quantized[block_idx, offset_in_block, 0, :]  # [total_tokens, topk, bytes_per_token]
+    gathered_bytes = kv_per_block[flat_block_idx, flat_offset]
+    gathered_bytes = gathered_bytes.view(total_tokens, topk, bytes_per_token)
 
-    # Extract FP8 nope part
-    nope_bytes = gathered_bytes[..., :d_nope].contiguous()
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)
+    nope_fp8 = gathered_bytes[..., :d_nope].view(torch.float8_e4m3fn)
+    scales = gathered_bytes[..., d_nope:d_nope + num_tiles * 4].contiguous().view(torch.float32)
+    rope_bf16 = gathered_bytes[..., d_nope + num_tiles * 4:].contiguous().view(torch.bfloat16)
 
-    # Extract scales (4 float32 values)
-    scale_bytes = gathered_bytes[..., d_nope:d_nope + num_tiles * 4].contiguous()
-    scales = scale_bytes.view(torch.float32)
-
-    # Extract BF16 rope part
-    rope_bytes = gathered_bytes[..., d_nope + num_tiles * 4:].contiguous()
-    rope_bf16 = rope_bytes.view(torch.bfloat16)
-
-    # Dequantize NOPE: fp8 * scale -> bf16 (OPTIMIZED: Vectorized, no for-loop)
     output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
-
-    # Convert FP8 nope to float32
-    nope_f32 = nope_fp8.to(torch.float32)  # [total_tokens, topk, d_nope]
-
-    # Expand scales to match nope shape: each scale applies to tile_size (128) elements
-    # scales shape: [total_tokens, topk, 4]
-    # We need: [total_tokens, topk, 512] where each scale is repeated 128 times
-    scales_expanded = scales.repeat_interleave(tile_size, dim=-1)  # [total_tokens, topk, 512]
-
-    # Multiply all at once and convert to bf16
+    nope_f32 = nope_fp8.to(torch.float32)
+    scales_expanded = scales.repeat_interleave(tile_size, dim=-1)
     output[..., :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
-
-    # Copy ROPE part
     output[..., d_nope:] = rope_bf16
 
-    # Zero out invalid positions
     output[invalid_mask] = 0
-
     return output
 
 
-def gather_dequant_fp8_model1(
-    kv_cache_quantized: torch.Tensor,  # [num_blocks, block_size, 1, bytes_per_token]
-    indices: torch.Tensor,              # [total_tokens, topk] - flattened indices
-    invalid_mask: torch.Tensor,         # [total_tokens, topk]
+def gather_dequant_fp8_model1_small(
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    invalid_mask: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """
-    Gather and dequantize FP8 KV cache to BF16 for MODEL1 layout (d_qk=512).
-    OPTIMIZED: Uses as_strided to avoid potential memory copy from reshape.
-
-    MODEL1 memory layout within each block:
-    - First block_size * 576 bytes: data (nope + rope) for all tokens
-    - Next block_size * 8 bytes: scales for all tokens
-    """
+    """MODEL1 layout - optimized for small topk using advanced indexing."""
     d_qk = 512
     d_nope = 448
     d_rope = 64
@@ -104,98 +70,143 @@ def gather_dequant_fp8_model1(
     total_tokens, topk = indices.shape
     device = kv_cache_quantized.device
     num_blocks = kv_cache_quantized.shape[0]
-    bytes_per_token = kv_cache_quantized.shape[3]
 
-    # Clamp invalid indices to 0
     indices_clamped = torch.clamp(indices, min=0)
-
-    # Compute block index and offset within block
     block_idx = indices_clamped // block_size
     offset_in_block = indices_clamped % block_size
 
-    # Use as_strided to create a view without triggering a copy
-    # This works even when the tensor has padding between blocks
     kv_uint8 = kv_cache_quantized.view(torch.uint8)
-    actual_block_stride = kv_uint8.stride()[0]
-    target_shape = (num_blocks, block_size * bytes_per_token)
-    target_stride = (actual_block_stride, 1)
-    kv_cache_bytes = torch.as_strided(kv_uint8, target_shape, target_stride)
+    bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
+    kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
 
-    # Calculate offsets for data and scales
-    scale_base_offset = block_size * bytes_per_token_data
+    nope_rope_size = block_size * bytes_per_token_data
+    nope_rope_view = kv_flat[:, :nope_rope_size].view(num_blocks, block_size, bytes_per_token_data)
+    scale_offset = nope_rope_size
+    scales_view = kv_flat[:, scale_offset:scale_offset + block_size * bytes_per_token_scale].view(num_blocks, block_size, bytes_per_token_scale)
 
-    # Flatten indices for efficient gathering
-    flat_block_idx = block_idx.reshape(-1)
-    flat_offset = offset_in_block.reshape(-1)
+    flat_block_idx = block_idx.view(-1)
+    flat_offset = offset_in_block.view(-1)
 
-    # Gather nope data (448 bytes) - vectorized
-    nope_byte_indices = flat_offset[:, None] * bytes_per_token_data + torch.arange(d_nope, device=device)[None, :]
-    gathered_nope_bytes = kv_cache_bytes[flat_block_idx[:, None].expand(-1, d_nope), nope_byte_indices]
-    gathered_nope = gathered_nope_bytes.reshape(total_tokens, topk, d_nope).view(torch.float8_e4m3fn)
+    # Use advanced indexing for small cases (avoids reshape overhead)
+    gathered_nope_rope = nope_rope_view[flat_block_idx, flat_offset]
+    gathered_scales = scales_view[flat_block_idx, flat_offset]
 
-    # Gather rope data (128 bytes = 64 bf16) - vectorized
-    rope_byte_indices = flat_offset[:, None] * bytes_per_token_data + d_nope + torch.arange(d_rope * 2, device=device)[None, :]
-    gathered_rope_bytes = kv_cache_bytes[flat_block_idx[:, None].expand(-1, d_rope * 2), rope_byte_indices]
-    gathered_rope = gathered_rope_bytes.reshape(total_tokens, topk, d_rope * 2).contiguous().view(torch.bfloat16)
+    gathered_nope_rope = gathered_nope_rope.view(total_tokens, topk, bytes_per_token_data)
+    gathered_scales = gathered_scales.view(total_tokens, topk, bytes_per_token_scale)
 
-    # Gather scale data (7 bytes) - vectorized
-    scale_byte_indices = scale_base_offset + flat_offset[:, None] * bytes_per_token_scale + torch.arange(num_tiles, device=device)[None, :]
-    gathered_scale_bytes = kv_cache_bytes[flat_block_idx[:, None].expand(-1, num_tiles), scale_byte_indices]
-    gathered_scales = gathered_scale_bytes.reshape(total_tokens, topk, num_tiles).view(torch.float8_e8m0fnu)
+    gathered_nope = gathered_nope_rope[..., :d_nope].view(torch.float8_e4m3fn)
+    gathered_rope = gathered_nope_rope[..., d_nope:].contiguous().view(torch.bfloat16)
+    gathered_scales = gathered_scales[..., :num_tiles].view(torch.float8_e8m0fnu)
 
-    # Dequantize NOPE: fp8 * scale -> bf16
     nope_bf16 = gathered_nope.to(torch.bfloat16)
     scales_bf16 = gathered_scales.to(torch.bfloat16)
     scales_expanded = scales_bf16.repeat_interleave(tile_size, dim=-1)
 
-    # Create output and assemble
     output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
     output[..., :d_nope] = nope_bf16 * scales_expanded
     output[..., d_nope:] = gathered_rope
 
-    # Zero out invalid positions
     output[invalid_mask] = 0
-
     return output
+
+
+def gather_dequant_fp8_model1_large(
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """MODEL1 layout - optimized for large topk using index_select."""
+    d_qk = 512
+    d_nope = 448
+    d_rope = 64
+    tile_size = 64
+    num_tiles = 7
+    bytes_per_token_data = d_nope + d_rope * 2  # 576
+    bytes_per_token_scale = 8
+
+    total_tokens, topk = indices.shape
+    device = kv_cache_quantized.device
+    num_blocks = kv_cache_quantized.shape[0]
+
+    indices_clamped = torch.clamp(indices, min=0)
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
+
+    kv_uint8 = kv_cache_quantized.view(torch.uint8)
+    bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
+    kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
+
+    nope_rope_size = block_size * bytes_per_token_data
+    nope_rope_data = kv_flat[:, :nope_rope_size].reshape(num_blocks, block_size, bytes_per_token_data)
+    scale_offset = nope_rope_size
+    scales_data = kv_flat[:, scale_offset:scale_offset + block_size * bytes_per_token_scale].reshape(num_blocks, block_size, bytes_per_token_scale)
+
+    # Flatten for index_select
+    nope_rope_flat = nope_rope_data.reshape(num_blocks * block_size, bytes_per_token_data)
+    scales_flat = scales_data.reshape(num_blocks * block_size, bytes_per_token_scale)
+
+    flat_indices = (block_idx * block_size + offset_in_block).view(-1)
+
+    # Use index_select for large cases
+    gathered_nope_rope = nope_rope_flat.index_select(0, flat_indices)
+    gathered_scales = scales_flat.index_select(0, flat_indices)
+
+    gathered_nope_rope = gathered_nope_rope.view(total_tokens, topk, bytes_per_token_data)
+    gathered_scales = gathered_scales.view(total_tokens, topk, bytes_per_token_scale)
+
+    gathered_nope = gathered_nope_rope[..., :d_nope].view(torch.float8_e4m3fn)
+    gathered_rope = gathered_nope_rope[..., d_nope:].contiguous().view(torch.bfloat16)
+    gathered_scales = gathered_scales[..., :num_tiles].view(torch.float8_e8m0fnu)
+
+    nope_bf16 = gathered_nope.to(torch.bfloat16)
+    scales_bf16 = gathered_scales.to(torch.bfloat16)
+    scales_expanded = scales_bf16.repeat_interleave(tile_size, dim=-1)
+
+    output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
+    output[..., :d_nope] = nope_bf16 * scales_expanded
+    output[..., d_nope:] = gathered_rope
+
+    output[invalid_mask] = 0
+    return output
+
+
+def gather_dequant_fp8_model1(
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """MODEL1 layout - hybrid approach selecting best method based on size."""
+    total_tokens, topk = indices.shape
+    # Use index_select for large gather operations (threshold tuned empirically)
+    if total_tokens * topk > 500000:  # ~500K elements
+        return gather_dequant_fp8_model1_large(kv_cache_quantized, indices, invalid_mask, block_size)
+    else:
+        return gather_dequant_fp8_model1_small(kv_cache_quantized, indices, invalid_mask, block_size)
 
 
 @triton.jit
 def _sparse_decode_attn_kernel_fused(
-    Q, KV, InvalidMask,
-    AttnSink,
-    Output, LSE,
-    sm_scale,
-    total_tokens, h_q, topk, d_qk, d_v,
+    Q, KV, InvalidMask, AttnSink, Output, LSE,
+    sm_scale, total_tokens, h_q, topk, d_qk, d_v,
     stride_q_t, stride_q_h, stride_q_d,
     stride_kv_t, stride_kv_k, stride_kv_d,
     stride_mask_t, stride_mask_k,
     stride_o_t, stride_o_h, stride_o_d,
     stride_lse_t, stride_lse_h,
     HAS_ATTN_SINK: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    """
-    Fused sparse decode attention kernel.
-    Q: [total_tokens, h_q, d_qk]
-    KV: [total_tokens, topk, d_qk]
-    InvalidMask: [total_tokens, topk]
-    Output: [total_tokens, h_q, d_v]
-    LSE: [total_tokens, h_q]
-    """
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
-
     NEG_INF = float("-inf")
     POS_INF = float("+inf")
 
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offs_h < h_q
-
     m_i = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
-
     acc_0 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     acc_1 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     acc_2 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
@@ -208,36 +219,27 @@ def _sparse_decode_attn_kernel_fused(
     for n_start in range(0, topk, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < topk
-
         mask_ptrs = mask_base + offs_n * stride_mask_k
         invalid = tl.load(mask_ptrs, mask=mask_n, other=True)
         valid = mask_n & ~invalid
-
         qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
         for d_start in range(0, d_qk, BLOCK_D):
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < d_qk
-
             q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
             q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
-
             k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
-
             qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
 
         qk = qk * sm_scale
         qk = tl.where(valid[None, :], qk, NEG_INF)
-
         m_ij = tl.max(qk, axis=1)
         m_new = tl.maximum(m_i, m_ij)
-
         alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
         p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-
         l_new = alpha * l_i + tl.sum(p, axis=1)
-
         p_bf16 = p.to(tl.bfloat16)
 
         offs_v = tl.arange(0, BLOCK_D)
@@ -264,7 +266,6 @@ def _sparse_decode_attn_kernel_fused(
         l_i = l_new
 
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
-
     is_lonely_q = (l_i == 0.0)
 
     if HAS_ATTN_SINK:
@@ -276,164 +277,93 @@ def _sparse_decode_attn_kernel_fused(
     else:
         output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
 
-    acc_0 = acc_0 * output_scale[:, None]
-    acc_1 = acc_1 * output_scale[:, None]
-    acc_2 = acc_2 * output_scale[:, None]
-    acc_3 = acc_3 * output_scale[:, None]
-
-    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0)
-    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1)
-    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2)
-    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3)
-
+    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
+    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
+    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
+    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
     lse = tl.where(is_lonely_q, POS_INF, lse)
 
-    lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
-    tl.store(lse_ptrs, lse, mask=mask_h)
+    tl.store(LSE + pid_t * stride_lse_t + offs_h * stride_lse_h, lse, mask=mask_h)
 
     o_base = Output + pid_t * stride_o_t
-
     offs_v = tl.arange(0, BLOCK_D)
-    o_ptrs = o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d
-    tl.store(o_ptrs, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
-
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
     offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
-    o_ptrs = o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d
-    tl.store(o_ptrs, acc_1.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
-
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_1.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
     offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
-    o_ptrs = o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d
-    tl.store(o_ptrs, acc_2.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
-
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_2.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
     offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
-    o_ptrs = o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d
-    tl.store(o_ptrs, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
 
 
 def _run_triton_attention_fused(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale,
                                  total_tokens, h_q, total_topk, d_qk, attn_sink=None):
-    """Run the optimized Triton kernel with gathered BF16 KV data."""
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
-
-    BLOCK_H = BLOCK_H_OPT
-    BLOCK_N = BLOCK_N_OPT
-    BLOCK_D = BLOCK_D_OPT
-
-    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
-
+    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H_OPT))
     HAS_ATTN_SINK = attn_sink is not None
-
-    if attn_sink is None:
-        attn_sink_tensor = torch.empty(1, device=q_reshaped.device, dtype=torch.float32)
-    else:
-        attn_sink_tensor = attn_sink
+    attn_sink_tensor = attn_sink if attn_sink is not None else torch.empty(1, device=q_reshaped.device, dtype=torch.float32)
 
     _sparse_decode_attn_kernel_fused[grid](
-        q_reshaped, gathered_kv, invalid_mask_reshaped,
-        attn_sink_tensor,
-        output, lse,
-        sm_scale,
-        total_tokens, h_q, total_topk, d_qk, d_v,
+        q_reshaped, gathered_kv, invalid_mask_reshaped, attn_sink_tensor, output, lse,
+        sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
         q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
         gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
         invalid_mask_reshaped.stride(0), invalid_mask_reshaped.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
         HAS_ATTN_SINK=HAS_ATTN_SINK,
-        BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-        num_warps=4,
-        num_stages=1,
+        BLOCK_H=BLOCK_H_OPT, BLOCK_N=BLOCK_N_OPT, BLOCK_D=BLOCK_D_OPT,
+        num_warps=4, num_stages=1,
     )
-
     return output, lse
 
 
 def _run_pytorch_attention(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk):
-    """Fallback to PyTorch for very large topk."""
     attn_weight = q_reshaped @ gathered_kv.transpose(-1, -2)
     attn_weight *= sm_scale
     attn_weight[invalid_mask_reshaped.unsqueeze(1).broadcast_to(total_tokens, h_q, total_topk)] = float("-inf")
-
     lse = attn_weight.logsumexp(dim=-1)
     attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
     output = (attn_weight @ gathered_kv[..., :d_v]).to(torch.bfloat16)
-
     return output, lse
 
 
 def triton_sparse_attn_decode(
-    q: torch.Tensor,
-    kv_scope,
-    extra_kv_scope,
-    sm_scale: float,
-    d_v: int = 512,
-    attn_sink: Optional[torch.Tensor] = None,
+    q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
+    d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sparse attention decode using Triton.
-
-    Takes FP8 quantized KV cache as input and performs gather + dequant
-    for both V32 (d_qk=576) and MODEL1 (d_qk=512) layouts.
-    """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
 
-    def process_kv_scope(scope) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process KV scope with FP8 gather + dequant."""
+    def process_kv_scope(scope):
         assert scope.indices_in_kvcache is not None
         topk = scope.indices_in_kvcache.size(-1)
-
-        # Get block size
         block_size = scope.blocked_k.shape[1]
-
-        # Build invalid mask
         invalid_mask = scope.indices_in_kvcache == -1
         if scope.topk_length is not None:
             invalid_mask = invalid_mask | (
                 torch.arange(0, topk, device=q.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
                 >= scope.topk_length.view(b, 1, 1)
             )
-
-        # Reshape for processing
         total_tokens = b * s_q
         indices_reshaped = scope.indices_in_kvcache.reshape(total_tokens, topk)
         invalid_mask_reshaped = invalid_mask.reshape(total_tokens, topk)
 
-        # Use FP8 gather + dequant
         if scope.blocked_k_quantized is not None:
             if d_qk == 576:
-                # V32 layout
-                gathered_kv = gather_dequant_fp8_v32(
-                    scope.blocked_k_quantized,
-                    indices_reshaped,
-                    invalid_mask_reshaped,
-                    block_size
-                )
+                gathered_kv = gather_dequant_fp8_v32(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size)
             elif d_qk == 512:
-                # MODEL1 layout
-                gathered_kv = gather_dequant_fp8_model1(
-                    scope.blocked_k_quantized,
-                    indices_reshaped,
-                    invalid_mask_reshaped,
-                    block_size
-                )
+                gathered_kv = gather_dequant_fp8_model1(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size)
             else:
                 raise ValueError(f"Unsupported d_qk: {d_qk}")
         else:
-            # Fallback if no quantized data (should not happen in normal use)
             indices_clamped = torch.clamp(indices_reshaped, min=0)
-            gathered_kv = scope.blocked_k.view(-1, d_qk).index_select(
-                0, indices_clamped.view(-1)
-            ).view(total_tokens, topk, d_qk).to(torch.bfloat16)
+            gathered_kv = scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk, d_qk).to(torch.bfloat16)
             gathered_kv[invalid_mask_reshaped] = 0
-
         return gathered_kv, invalid_mask_reshaped
 
     gathered_kv, invalid_mask_reshaped = process_kv_scope(kv_scope)
-
     if extra_kv_scope is not None:
         gathered_kv_extra, invalid_mask_extra = process_kv_scope(extra_kv_scope)
         gathered_kv = torch.cat([gathered_kv, gathered_kv_extra], dim=1)
@@ -441,50 +371,27 @@ def triton_sparse_attn_decode(
 
     total_topk = gathered_kv.shape[1]
     total_tokens = b * s_q
-
-    # Ensure BF16 and handle NaN
     gathered_kv = gathered_kv.to(torch.bfloat16)
     gathered_kv = torch.where(gathered_kv != gathered_kv, torch.zeros_like(gathered_kv), gathered_kv)
-
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 
-    if not q_reshaped.is_contiguous():
-        q_reshaped = q_reshaped.contiguous()
-    if not gathered_kv.is_contiguous():
-        gathered_kv = gathered_kv.contiguous()
-    if not invalid_mask_reshaped.is_contiguous():
-        invalid_mask_reshaped = invalid_mask_reshaped.contiguous()
+    if not q_reshaped.is_contiguous(): q_reshaped = q_reshaped.contiguous()
+    if not gathered_kv.is_contiguous(): gathered_kv = gathered_kv.contiguous()
+    if not invalid_mask_reshaped.is_contiguous(): invalid_mask_reshaped = invalid_mask_reshaped.contiguous()
 
-    USE_TRITON = total_topk <= 8192
-
-    if USE_TRITON:
-        output, lse = _run_triton_attention_fused(
-            q_reshaped, gathered_kv, invalid_mask_reshaped,
-            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-            attn_sink=attn_sink
-        )
+    if total_topk <= 8192:
+        output, lse = _run_triton_attention_fused(q_reshaped, gathered_kv, invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk, d_qk, attn_sink=attn_sink)
     else:
-        q_reshaped_f32 = q_reshaped.float()
-        gathered_kv_f32 = gathered_kv.float()
-        output, lse = _run_pytorch_attention(
-            q_reshaped_f32, gathered_kv_f32, invalid_mask_reshaped,
-            d_v, sm_scale, total_tokens, h_q, total_topk
-        )
+        output, lse = _run_pytorch_attention(q_reshaped.float(), gathered_kv.float(), invalid_mask_reshaped, d_v, sm_scale, total_tokens, h_q, total_topk)
         output = output.view(b, s_q, h_q, d_v)
         lse = lse.view(b, s_q, h_q)
-
         if attn_sink is not None:
             output = output.float()
             output *= (1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))).unsqueeze(-1)
             output = output.to(torch.bfloat16)
-
         lonely_q_mask = (lse == float("-inf"))
         output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
         lse[lonely_q_mask] = float("+inf")
-
         return output, lse.transpose(1, 2)
 
-    output = output.view(b, s_q, h_q, d_v)
-    lse = lse.view(b, s_q, h_q)
-
-    return output, lse.transpose(1, 2)
+    return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
