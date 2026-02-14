@@ -138,19 +138,16 @@ def gather_dequant_fp8_model1_large(
     kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
 
     nope_rope_size = block_size * bytes_per_token_data
-    nope_rope_data = kv_flat[:, :nope_rope_size].reshape(num_blocks, block_size, bytes_per_token_data)
+    nope_rope_data = kv_flat[:, :nope_rope_size].view(num_blocks, block_size, bytes_per_token_data)
     scale_offset = nope_rope_size
-    scales_data = kv_flat[:, scale_offset:scale_offset + block_size * bytes_per_token_scale].reshape(num_blocks, block_size, bytes_per_token_scale)
+    scales_data = kv_flat[:, scale_offset:scale_offset + block_size * bytes_per_token_scale].view(num_blocks, block_size, bytes_per_token_scale)
 
-    # Flatten for index_select
-    nope_rope_flat = nope_rope_data.reshape(num_blocks * block_size, bytes_per_token_data)
-    scales_flat = scales_data.reshape(num_blocks * block_size, bytes_per_token_scale)
+    # Use 2D advanced indexing (avoids expensive flatten/copy for non-contiguous tensors)
+    flat_block_idx = block_idx.view(-1)
+    flat_offset = offset_in_block.view(-1)
 
-    flat_indices = (block_idx * block_size + offset_in_block).view(-1)
-
-    # Use index_select for large cases
-    gathered_nope_rope = nope_rope_flat.index_select(0, flat_indices)
-    gathered_scales = scales_flat.index_select(0, flat_indices)
+    gathered_nope_rope = nope_rope_data[flat_block_idx, flat_offset]
+    gathered_scales = scales_data[flat_block_idx, flat_offset]
 
     gathered_nope_rope = gathered_nope_rope.view(total_tokens, topk, bytes_per_token_data)
     gathered_scales = gathered_scales.view(total_tokens, topk, bytes_per_token_scale)
