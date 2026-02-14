@@ -53,15 +53,19 @@ def gather_dequant_fp8_v32(
     rope_bytes = gathered_bytes[..., d_nope + num_tiles * 4:].contiguous()
     rope_bf16 = rope_bytes.view(torch.bfloat16)
 
-    # Dequantize NOPE: fp8 * scale -> bf16
+    # Dequantize NOPE: fp8 * scale -> bf16 (OPTIMIZED: Vectorized, no for-loop)
     output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
 
-    for tile_idx in range(num_tiles):
-        tile_start = tile_idx * tile_size
-        tile_end = tile_start + tile_size
-        cur_nope = nope_fp8[..., tile_start:tile_end].to(torch.float32)
-        cur_scale = scales[..., tile_idx:tile_idx+1]
-        output[..., tile_start:tile_end] = (cur_nope * cur_scale).to(torch.bfloat16)
+    # Convert FP8 nope to float32
+    nope_f32 = nope_fp8.to(torch.float32)  # [total_tokens, topk, d_nope]
+
+    # Expand scales to match nope shape: each scale applies to tile_size (128) elements
+    # scales shape: [total_tokens, topk, 4]
+    # We need: [total_tokens, topk, 512] where each scale is repeated 128 times
+    scales_expanded = scales.repeat_interleave(tile_size, dim=-1)  # [total_tokens, topk, 512]
+
+    # Multiply all at once and convert to bf16
+    output[..., :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
 
     # Copy ROPE part
     output[..., d_nope:] = rope_bf16
@@ -135,14 +139,18 @@ def gather_dequant_fp8_model1(
     gathered_scale_bytes = kv_cache_bytes[flat_block_idx[:, None].expand(-1, num_tiles), scale_byte_indices]
     gathered_scales = gathered_scale_bytes.view(total_tokens, topk, num_tiles).view(torch.float8_e8m0fnu)
 
-    # Dequantize NOPE: fp8 * scale -> bf16
-    for tile_idx in range(num_tiles):
-        tile_start = tile_idx * tile_size
-        tile_end = min(tile_start + tile_size, d_nope)
+    # Dequantize NOPE: fp8 * scale -> bf16 (OPTIMIZED: Vectorized, no for-loop)
+    # Convert all FP8 data to BF16 at once
+    nope_bf16 = gathered_nope.to(torch.bfloat16)  # [total_tokens, topk, d_nope]
+    scales_bf16 = gathered_scales.to(torch.bfloat16)  # [total_tokens, topk, num_tiles]
 
-        cur_nope = gathered_nope[..., tile_start:tile_end].to(torch.bfloat16)
-        cur_scale = gathered_scales[..., tile_idx:tile_idx+1].to(torch.bfloat16)
-        output[..., tile_start:tile_end] = cur_nope * cur_scale
+    # Expand scales to match nope shape: each scale applies to tile_size (64) elements
+    # scales_bf16 shape: [total_tokens, topk, 7]
+    # We need: [total_tokens, topk, 448] where each scale is repeated 64 times
+    scales_expanded = scales_bf16.repeat_interleave(tile_size, dim=-1)  # [total_tokens, topk, 448]
+
+    # Multiply all at once
+    output[..., :d_nope] = nope_bf16 * scales_expanded
 
     # Copy ROPE part
     output[..., d_nope:] = gathered_rope
