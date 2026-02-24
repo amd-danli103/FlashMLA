@@ -40,7 +40,6 @@ V32_TILE_SIZE = 128
 V32_NUM_TILES = 4
 V32_BYTES_PER_TOKEN = 656
 
-
 # ============================================================================
 # Optimized Gather+Dequant Kernels
 # ============================================================================
@@ -177,7 +176,6 @@ def _gather_dequant_model1_kernel(
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
-
 def gather_dequant_fp8_model1_triton(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
@@ -222,7 +220,6 @@ def gather_dequant_fp8_model1_triton(
     )
 
     return output
-
 
 @triton.autotune(
     configs=[
@@ -354,7 +351,6 @@ def _gather_dequant_v32_kernel(
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
-
 def gather_dequant_fp8_v32_triton(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
@@ -397,7 +393,6 @@ def gather_dequant_fp8_v32_triton(
     )
 
     return output
-
 
 # ============================================================================
 # PyTorch Fallback Implementations
@@ -458,7 +453,6 @@ def gather_dequant_fp8_model1_fast(
     output[invalid_mask] = 0
     return output
 
-
 def gather_dequant_fp8_v32_pytorch(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
@@ -501,7 +495,6 @@ def gather_dequant_fp8_v32_pytorch(
     output[invalid_mask] = 0
     return output
 
-
 # ============================================================================
 # Main Entry Points
 # ============================================================================
@@ -524,7 +517,6 @@ def gather_dequant_fp8_model1(
 
     return gather_dequant_fp8_model1_triton(kv_cache_quantized, indices, invalid_mask, block_size)
 
-
 def gather_dequant_fp8_v32(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
@@ -543,7 +535,6 @@ def gather_dequant_fp8_v32(
         return gather_dequant_fp8_v32_pytorch(kv_cache_quantized, indices, invalid_mask, block_size)
 
     return gather_dequant_fp8_v32_triton(kv_cache_quantized, indices, invalid_mask, block_size)
-
 
 # ============================================================================
 # Attention Kernel
@@ -743,7 +734,6 @@ def _fused_sparse_decode_kernel_dual_scope(
     offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
     tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
 
-
 def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_extra,
                                d_v, sm_scale, total_tokens, h_q, topk_main, topk_extra, d_qk,
                                attn_sink=None):
@@ -754,12 +744,17 @@ def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_ext
     HAS_EXTRA_KV = kv_extra is not None
     HAS_ATTN_SINK = attn_sink is not None
 
-    attn_sink_tensor = attn_sink if attn_sink is not None else torch.empty(1, device=q_reshaped.device, dtype=torch.float32)
-
+    # Optimization: Reuse existing tensors instead of allocating dummy tensors
+    # When HAS_EXTRA_KV=False, the kernel never accesses kv_extra/mask_extra
+    # When HAS_ATTN_SINK=False, the kernel never accesses attn_sink_tensor
+    # So we can safely reuse kv_main/mask_main as placeholders to avoid allocator pressure
     if not HAS_EXTRA_KV:
-        kv_extra = torch.empty(1, 1, 1, device=q_reshaped.device, dtype=torch.bfloat16)
-        mask_extra = torch.empty(1, 1, device=q_reshaped.device, dtype=torch.bool)
+        kv_extra = kv_main  # Reuse kv_main as placeholder (not accessed when HAS_EXTRA_KV=False)
+        mask_extra = mask_main  # Reuse mask_main as placeholder
         topk_extra = 0
+
+    # Reuse lse tensor as placeholder for attn_sink when not needed (lse is already float32)
+    attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
     _fused_sparse_decode_kernel_dual_scope[grid](
         q_reshaped,
@@ -781,7 +776,6 @@ def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_ext
         num_warps=4, num_stages=1,
     )
     return output, lse
-
 
 def triton_sparse_attn_decode(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
