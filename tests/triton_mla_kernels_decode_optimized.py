@@ -19,9 +19,9 @@ from typing import Optional, Tuple
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # Block sizes for attention kernel
-BLOCK_H = 16
-BLOCK_N = 64
-BLOCK_D = 128
+# BLOCK_H = 16  # Now controlled by autotune
+# BLOCK_N = 64  # Now controlled by autotune
+# BLOCK_D = 128  # Now controlled by autotune
 
 # Constants for MODEL1 layout
 MODEL1_D_QK = 512
@@ -540,6 +540,25 @@ def gather_dequant_fp8_v32(
 # Attention Kernel
 # ============================================================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 32, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 8, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 8, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 8, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32, "BLOCK_D": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=2, num_stages=1),
+    ],
+    key=["total_tokens", "h_q", "topk_main", "d_qk"],
+)
 @triton.jit
 def _fused_sparse_decode_kernel_dual_scope(
     Q,
@@ -740,7 +759,7 @@ def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_ext
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
 
-    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
+    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
     HAS_EXTRA_KV = kv_extra is not None
     HAS_ATTN_SINK = attn_sink is not None
 
@@ -772,8 +791,6 @@ def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_ext
         lse.stride(0), lse.stride(1),
         HAS_EXTRA_KV=HAS_EXTRA_KV,
         HAS_ATTN_SINK=HAS_ATTN_SINK,
-        BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
-        num_warps=4, num_stages=1,
     )
     return output, lse
 
