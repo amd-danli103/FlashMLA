@@ -823,23 +823,23 @@ def triton_sparse_attn_decode(
         gathered_kv_extra, invalid_mask_extra = process_kv_scope(extra_kv_scope)
         topk_extra = gathered_kv_extra.shape[1]
 
-    gathered_kv_main = torch.where(gathered_kv_main != gathered_kv_main, torch.zeros_like(gathered_kv_main), gathered_kv_main)
+    # Use nan_to_num for efficient in-place NaN cleaning (avoids zeros_like allocation)
+    gathered_kv_main = torch.nan_to_num(gathered_kv_main, nan=0.0)
     if gathered_kv_extra is not None:
-        gathered_kv_extra = torch.where(gathered_kv_extra != gathered_kv_extra, torch.zeros_like(gathered_kv_extra), gathered_kv_extra)
+        gathered_kv_extra = torch.nan_to_num(gathered_kv_extra, nan=0.0)
 
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 
+    # Ensure q_reshaped is contiguous (input q may have non-standard layout)
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
-    if not gathered_kv_main.is_contiguous():
-        gathered_kv_main = gathered_kv_main.contiguous()
-    if not invalid_mask_main.is_contiguous():
-        invalid_mask_main = invalid_mask_main.contiguous()
+
+    # Assert contiguity for tensors that should always be contiguous
+    assert gathered_kv_main.is_contiguous(), "gathered_kv_main should be contiguous"
+    assert invalid_mask_main.is_contiguous(), "invalid_mask_main should be contiguous"
     if gathered_kv_extra is not None:
-        if not gathered_kv_extra.is_contiguous():
-            gathered_kv_extra = gathered_kv_extra.contiguous()
-        if not invalid_mask_extra.is_contiguous():
-            invalid_mask_extra = invalid_mask_extra.contiguous()
+        assert gathered_kv_extra.is_contiguous(), "gathered_kv_extra should be contiguous"
+        assert invalid_mask_extra.is_contiguous(), "invalid_mask_extra should be contiguous"
 
     total_topk = topk_main + topk_extra
 
