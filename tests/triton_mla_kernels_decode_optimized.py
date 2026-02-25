@@ -777,6 +777,141 @@ def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_ext
     )
     return output, lse
 
+def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
+                                   d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+                                   attn_sink=None, chunk_size=8192):
+    """
+    Chunked attention using Triton kernels with cross-chunk softmax merging.
+
+    This implementation matches the behavior of the PyTorch fallback:
+    - For queries with all invalid KV, output is 0 and lse is +inf
+    - Uses LSE-based merging algorithm for normalized outputs
+
+    The kernel returns:
+    - chunk_output: normalized attention output = sum(softmax * V)
+    - chunk_lse: log-sum-exp = log(sum(exp(scores)))
+
+    For merging normalized outputs with LSE values:
+    - lse_new = log(exp(lse_old) + exp(lse_new_chunk))
+    - output_new = output_old * exp(lse_old - lse_new) + output_chunk * exp(lse_chunk - lse_new)
+    """
+    device = q_reshaped.device
+
+    # Calculate number of chunks
+    num_chunks = (total_topk + chunk_size - 1) // chunk_size
+
+    # Pre-split the KV and mask into contiguous chunks
+    kv_chunks = []
+    mask_chunks = []
+    chunk_sizes = []
+
+    for chunk_idx in range(num_chunks):
+        start_k = chunk_idx * chunk_size
+        end_k = min(start_k + chunk_size, total_topk)
+        chunk_topk = end_k - start_k
+        chunk_sizes.append(chunk_topk)
+        kv_chunks.append(gathered_kv[:, start_k:end_k, :].contiguous())
+        mask_chunks.append(invalid_mask[:, start_k:end_k].contiguous())
+
+    # Initialize accumulators
+    # lse_acc: running log-sum-exp (starts at -inf meaning "no valid tokens")
+    # acc: running weighted sum of normalized outputs (weighted by exp(lse))
+    lse_acc = torch.full((total_tokens, h_q), float('-inf'), dtype=torch.float32, device=device)
+    acc = torch.zeros((total_tokens, h_q, d_v), dtype=torch.float32, device=device)
+
+    for chunk_idx in range(num_chunks):
+        kv_chunk = kv_chunks[chunk_idx]
+        mask_chunk = mask_chunks[chunk_idx]
+        chunk_topk = chunk_sizes[chunk_idx]
+
+        # Run Triton kernel for this chunk
+        # The kernel returns:
+        # - chunk_output: normalized attention output (sum of softmax * V)
+        # - chunk_lse: log-sum-exp = log(sum(exp(scores))), or +inf for lonely queries
+        chunk_output, chunk_lse = _run_dual_scope_attention(
+            q_reshaped, kv_chunk, mask_chunk,
+            None, None,
+            d_v, sm_scale, total_tokens, h_q, chunk_topk, 0, d_qk,
+            attn_sink=None
+        )
+
+        # Identify lonely queries in this chunk (lse = +inf means no valid KV)
+        is_chunk_lonely = torch.isinf(chunk_lse) & (chunk_lse > 0)
+
+        # For lonely chunks, treat lse as -inf for merging purposes
+        chunk_lse_for_merge = torch.where(is_chunk_lonely,
+                                          torch.full_like(chunk_lse, float('-inf')),
+                                          chunk_lse)
+
+        # Compute the new combined LSE using log-sum-exp trick:
+        # lse_new = log(exp(lse_acc) + exp(chunk_lse))
+        #         = max(lse_acc, chunk_lse) + log(1 + exp(-|lse_acc - chunk_lse|))
+        #         = max(lse_acc, chunk_lse) + log(exp(lse_acc - max) + exp(chunk_lse - max))
+        lse_max = torch.maximum(lse_acc, chunk_lse_for_merge)
+
+        # Compute exp(lse_acc - lse_max) and exp(chunk_lse - lse_max)
+        # Handle -inf - (-inf) = nan -> 0
+        exp_acc = torch.exp(lse_acc - lse_max)
+        exp_acc = torch.where(torch.isnan(exp_acc), torch.zeros_like(exp_acc), exp_acc)
+
+        exp_chunk = torch.exp(chunk_lse_for_merge - lse_max)
+        exp_chunk = torch.where(torch.isnan(exp_chunk) | is_chunk_lonely,
+                                torch.zeros_like(exp_chunk), exp_chunk)
+
+        # New LSE = max + log(exp_acc + exp_chunk)
+        sum_exp = exp_acc + exp_chunk
+        lse_new = lse_max + torch.log(torch.where(sum_exp == 0, torch.ones_like(sum_exp), sum_exp))
+
+        # For completely empty case (both -inf), keep -inf
+        both_empty = (lse_acc == float('-inf')) & (chunk_lse_for_merge == float('-inf'))
+        lse_new = torch.where(both_empty, torch.full_like(lse_new, float('-inf')), lse_new)
+
+        # Compute weights for merging outputs
+        # weight_acc = exp(lse_acc - lse_new)
+        # weight_chunk = exp(chunk_lse - lse_new)
+        weight_acc = torch.exp(lse_acc - lse_new)
+        weight_acc = torch.where(torch.isnan(weight_acc) | torch.isinf(weight_acc),
+                                 torch.zeros_like(weight_acc), weight_acc)
+
+        weight_chunk = torch.exp(chunk_lse_for_merge - lse_new)
+        weight_chunk = torch.where(torch.isnan(weight_chunk) | torch.isinf(weight_chunk) | is_chunk_lonely,
+                                   torch.zeros_like(weight_chunk), weight_chunk)
+
+        # Update accumulator: acc_new = weight_acc * acc + weight_chunk * chunk_output
+        acc = weight_acc.unsqueeze(-1) * acc + weight_chunk.unsqueeze(-1) * chunk_output.float()
+
+        # Update LSE
+        lse_acc = lse_new
+
+    # Final output is already normalized (weights sum to 1 when lse values are correct)
+    output = acc
+    lse = lse_acc
+
+    # Identify lonely queries (lse = -inf means no valid tokens across all chunks)
+    is_lonely_final = (lse == float('-inf'))
+
+    # Set lse to +inf for lonely queries (to match reference behavior)
+    lse = torch.where(is_lonely_final, torch.full_like(lse, float('+inf')), lse)
+
+    # Apply attention sink if provided
+    if attn_sink is not None:
+        # The attention sink adds a virtual token with log-probability = attn_sink
+        # Final output = output * (exp(lse) / (exp(lse) + exp(attn_sink)))
+        #              = output * (1 / (1 + exp(attn_sink - lse)))
+        # For lonely queries (lse = +inf), this becomes 0
+        attn_sink_expanded = attn_sink.view(1, h_q)
+        exp_diff = torch.exp(attn_sink_expanded - lse)
+        # Handle inf - inf = nan
+        exp_diff = torch.where(is_lonely_final, torch.full_like(exp_diff, float('inf')), exp_diff)
+        scale = 1.0 / (1.0 + exp_diff)
+        output = output * scale.unsqueeze(-1)
+
+    # Set lonely query outputs to 0
+    output = torch.where(is_lonely_final.unsqueeze(-1), torch.zeros_like(output), output)
+
+    return output.to(torch.bfloat16), lse
+
+
 def triton_sparse_attn_decode(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
     d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
@@ -851,29 +986,18 @@ def triton_sparse_attn_decode(
             attn_sink=attn_sink
         )
     else:
+        # Use chunked Triton attention for large topk
         if gathered_kv_extra is not None:
             gathered_kv = torch.cat([gathered_kv_main, gathered_kv_extra], dim=1)
-            invalid_mask_reshaped = torch.cat([invalid_mask_main, invalid_mask_extra], dim=1)
+            invalid_mask_combined = torch.cat([invalid_mask_main, invalid_mask_extra], dim=1)
         else:
             gathered_kv = gathered_kv_main
-            invalid_mask_reshaped = invalid_mask_main
+            invalid_mask_combined = invalid_mask_main
 
-        attn_weight = q_reshaped.float() @ gathered_kv.float().transpose(-1, -2)
-        attn_weight *= sm_scale
-        attn_weight[invalid_mask_reshaped.unsqueeze(1).broadcast_to(total_tokens, h_q, total_topk)] = float("-inf")
-        lse = attn_weight.logsumexp(dim=-1)
-        attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
-        output = (attn_weight @ gathered_kv.float()[..., :d_v]).to(torch.bfloat16)
-
-        output = output.view(b, s_q, h_q, d_v)
-        lse = lse.view(b, s_q, h_q)
-        if attn_sink is not None:
-            output = output.float()
-            output *= (1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))).unsqueeze(-1)
-            output = output.to(torch.bfloat16)
-        lonely_q_mask = (lse == float("-inf"))
-        output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
-        lse[lonely_q_mask] = float("+inf")
-        return output, lse.transpose(1, 2)
+        output, lse = _run_chunked_attention_triton(
+            q_reshaped, gathered_kv, invalid_mask_combined,
+            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+            attn_sink=attn_sink, chunk_size=8192
+        )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
