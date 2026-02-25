@@ -1,5 +1,5 @@
 """
-Optimized Triton MLA Decode Kernels - Version 5.4
+Optimized Triton MLA Decode Kernels - Version 5.5
 
 Key optimizations:
 1. Fused Triton kernel for gather+dequant (significantly faster than PyTorch)
@@ -9,6 +9,7 @@ Key optimizations:
 5. Fixed 64-bit pointer arithmetic to avoid overflow with large KV caches
 6. Correct handling of MODEL1 block-level layout
 7. PyTorch fallback for large outputs to avoid int32 pointer overflow
+8. Enhanced autotune with workload size categories for gather-dequant kernels
 """
 
 import torch
@@ -40,18 +41,49 @@ V32_TILE_SIZE = 128
 V32_NUM_TILES = 4
 V32_BYTES_PER_TOKEN = 656
 
+
+# ============================================================================
+# Helper function to compute workload size category for autotune
+# ============================================================================
+def _get_workload_size_category(total_tokens: int, topk: int) -> int:
+    """
+    Compute workload size category for autotune key.
+    Returns:
+        0: small (< 10K elements)
+        1: medium (10K - 100K elements)
+        2: large (100K - 1M elements)
+        3: very large (> 1M elements)
+    """
+    total_elements = total_tokens * topk
+    if total_elements < 10000:
+        return 0
+    elif total_elements < 100000:
+        return 1
+    elif total_elements < 1000000:
+        return 2
+    else:
+        return 3
+
 # ============================================================================
 # Optimized Gather+Dequant Kernels
 # ============================================================================
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_TK': 16}, num_warps=2),
-        triton.Config({'BLOCK_TK': 32}, num_warps=4),
-        triton.Config({'BLOCK_TK': 64}, num_warps=4),
-        triton.Config({'BLOCK_TK': 128}, num_warps=8),
+        # Small workloads - smaller blocks, fewer warps
+        triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
+        # Medium workloads
+        triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
+        # Large workloads - larger blocks, more warps
+        triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
     ],
-    key=['total_tokens', 'topk'],
+    key=['total_tokens', 'topk', 'workload_size_cat'],
 )
 @triton.jit
 def _gather_dequant_model1_kernel(
@@ -64,6 +96,7 @@ def _gather_dequant_model1_kernel(
     topk,
     num_blocks,
     block_size,
+    workload_size_cat,  # Workload size category for autotune
     stride_kv_block,  # Stride between blocks (in bytes)
     stride_idx_t, stride_idx_k,
     stride_mask_t, stride_mask_k,
@@ -197,6 +230,9 @@ def gather_dequant_fp8_model1_triton(
 
     output = torch.empty(total_tokens, topk, MODEL1_D_QK, dtype=torch.bfloat16, device=device)
 
+    # Compute workload size category for autotune
+    workload_size_cat = _get_workload_size_category(total_tokens, topk)
+
     grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
 
     _gather_dequant_model1_kernel[grid](
@@ -208,6 +244,7 @@ def gather_dequant_fp8_model1_triton(
         topk,
         num_blocks,
         block_size,
+        workload_size_cat,
         stride_kv_block,
         indices.stride(0), indices.stride(1),
         invalid_mask.stride(0), invalid_mask.stride(1),
@@ -223,12 +260,20 @@ def gather_dequant_fp8_model1_triton(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_TK': 16}, num_warps=2),
-        triton.Config({'BLOCK_TK': 32}, num_warps=4),
-        triton.Config({'BLOCK_TK': 64}, num_warps=4),
-        triton.Config({'BLOCK_TK': 128}, num_warps=8),
+        # Small workloads - smaller blocks, fewer warps
+        triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
+        # Medium workloads
+        triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
+        # Large workloads - larger blocks, more warps
+        triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
     ],
-    key=['total_tokens', 'topk'],
+    key=['total_tokens', 'topk', 'workload_size_cat'],
 )
 @triton.jit
 def _gather_dequant_v32_kernel(
@@ -241,6 +286,7 @@ def _gather_dequant_v32_kernel(
     topk,
     num_blocks,
     block_size,
+    workload_size_cat,  # Workload size category for autotune
     stride_kv_block,
     stride_kv_token,
     stride_idx_t, stride_idx_k,
@@ -371,6 +417,9 @@ def gather_dequant_fp8_v32_triton(
 
     output = torch.empty(total_tokens, topk, V32_D_QK, dtype=torch.bfloat16, device=device)
 
+    # Compute workload size category for autotune
+    workload_size_cat = _get_workload_size_category(total_tokens, topk)
+
     grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
 
     _gather_dequant_v32_kernel[grid](
@@ -382,6 +431,7 @@ def gather_dequant_fp8_v32_triton(
         topk,
         num_blocks,
         block_size,
+        workload_size_cat,
         stride_kv_block, stride_kv_token,
         indices.stride(0), indices.stride(1),
         invalid_mask.stride(0), invalid_mask.stride(1),
