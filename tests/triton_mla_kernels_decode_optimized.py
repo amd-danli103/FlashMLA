@@ -1,5 +1,5 @@
 """
-Optimized Triton MLA Decode Kernels - Version 7.0 (Fused Mask Computation)
+Optimized Triton MLA Decode Kernels - Version 8.0 (Reduced Python Overhead)
 
 Key optimizations:
 1. Fused Triton kernel for gather+dequant (significantly faster than PyTorch)
@@ -12,6 +12,8 @@ Key optimizations:
 8. PyTorch fallback for large outputs to avoid int32 pointer overflow
 9. Enhanced autotune with workload size categories for gather-dequant kernels
 10. Fused mask computation with gather kernel (eliminates separate mask copy)
+11. NEW: Fused topk_length mask computation in Triton kernel (reduces Python overhead)
+12. NEW: Inlined scope processing to minimize function call overhead
 """
 
 import torch
@@ -62,6 +64,388 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
         return 3
 
 
+
+
+# ============================================================================
+# Fused Gather+Dequant+Mask Kernels with TopkLength support (NEW - reduces Python overhead)
+# ============================================================================
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
+    ],
+    key=['total_tokens', 'topk', 'workload_size_cat'],
+)
+@triton.jit
+def _gather_dequant_model1_fused_mask_kernel(
+    KV_Cache,
+    Indices,
+    TopkLength,
+    OutputKV,
+    OutputMask,
+    total_tokens,
+    topk,
+    num_blocks,
+    block_size,
+    workload_size_cat,
+    k_offset,
+    s_q,
+    stride_kv_block,
+    stride_idx_t, stride_idx_k,
+    stride_out_t, stride_out_k, stride_out_d,
+    stride_mask_t, stride_mask_k,
+    BLOCK_TK: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    BYTES_PER_TOKEN_DATA: tl.constexpr,
+    BYTES_PER_TOKEN_SCALE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HAS_TOPK_LENGTH: tl.constexpr,
+):
+    """Fused gather + dequant + mask kernel with topk_length support for MODEL1 layout."""
+    pid = tl.program_id(0)
+    num_tk = total_tokens * topk
+
+    offs_tk = pid * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    mask_tk = offs_tk < num_tk
+
+    t_idx = offs_tk // topk
+    k_idx = offs_tk % topk
+
+    idx_ptrs = Indices + t_idx * stride_idx_t + k_idx * stride_idx_k
+    indices = tl.load(idx_ptrs, mask=mask_tk, other=-1)
+
+    # Compute mask: indices == -1
+    is_invalid = indices == -1
+
+    # Handle topk_length mask if present (fused into kernel - eliminates Python overhead)
+    if HAS_TOPK_LENGTH:
+        batch_idx = t_idx // s_q
+        topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+        is_invalid = is_invalid | (k_idx >= topk_len)
+
+    # Write mask to output buffer
+    mask_out_ptrs = OutputMask + t_idx * stride_mask_t + (k_idx + k_offset) * stride_mask_k
+    tl.store(mask_out_ptrs, is_invalid, mask=mask_tk)
+
+    valid_mask = mask_tk & ~is_invalid
+    indices_clamped = tl.maximum(indices, 0)
+
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
+
+    block_idx_64 = block_idx.to(tl.int64)
+    offset_in_block_64 = offset_in_block.to(tl.int64)
+
+    kv_block_base = KV_Cache + block_idx_64 * stride_kv_block
+
+    nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+    scale_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+
+    t_idx_64 = t_idx.to(tl.int64)
+    k_idx_64 = k_idx.to(tl.int64)
+    out_base_ptrs = OutputKV + t_idx_64 * stride_out_t + (k_idx_64 + k_offset) * stride_out_k
+
+    for tile_idx in range(7):
+        tile_start = tile_idx * TILE_SIZE
+
+        scale_ptrs = kv_block_base + scale_offset + tile_idx
+        scale_uint8 = tl.load(scale_ptrs, mask=valid_mask, other=127).to(tl.uint8)
+
+        scale_exp = scale_uint8.to(tl.float32) - 127.0
+        scale_f32 = tl.math.exp2(scale_exp)
+        scale_bf16 = scale_f32.to(tl.bfloat16)
+
+        offs_d = tl.arange(0, TILE_SIZE)
+
+        nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start + offs_d[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        nope_bf16 = nope_fp8.to(tl.bfloat16)
+
+        dequant = nope_bf16 * scale_bf16[:, None]
+        dequant = tl.where(dequant != dequant, 0.0, dequant)
+        dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+        dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+
+        out_ptrs = out_base_ptrs[:, None] + (tile_start + offs_d[None, :]) * stride_out_d
+        tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    offs_rope = tl.arange(0, D_ROPE)
+    rope_byte_start = D_NOPE
+
+    rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
+    rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
+
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+
+    rope_uint16 = rope_lo | (rope_hi << 8)
+    rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
+    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+
+    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
+    ],
+    key=['total_tokens', 'topk', 'workload_size_cat'],
+)
+@triton.jit
+def _gather_dequant_v32_fused_mask_kernel(
+    KV_Cache,
+    Indices,
+    TopkLength,
+    OutputKV,
+    OutputMask,
+    total_tokens,
+    topk,
+    num_blocks,
+    block_size,
+    workload_size_cat,
+    k_offset,
+    s_q,
+    stride_kv_block,
+    stride_kv_token,
+    stride_idx_t, stride_idx_k,
+    stride_out_t, stride_out_k, stride_out_d,
+    stride_mask_t, stride_mask_k,
+    BLOCK_TK: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    HAS_TOPK_LENGTH: tl.constexpr,
+):
+    """Fused gather + dequant + mask kernel with topk_length support for V32 layout."""
+    pid = tl.program_id(0)
+    num_tk = total_tokens * topk
+
+    offs_tk = pid * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    mask_tk = offs_tk < num_tk
+
+    t_idx = offs_tk // topk
+    k_idx = offs_tk % topk
+
+    idx_ptrs = Indices + t_idx * stride_idx_t + k_idx * stride_idx_k
+    indices = tl.load(idx_ptrs, mask=mask_tk, other=-1)
+
+    is_invalid = indices == -1
+
+    if HAS_TOPK_LENGTH:
+        batch_idx = t_idx // s_q
+        topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+        is_invalid = is_invalid | (k_idx >= topk_len)
+
+    mask_out_ptrs = OutputMask + t_idx * stride_mask_t + (k_idx + k_offset) * stride_mask_k
+    tl.store(mask_out_ptrs, is_invalid, mask=mask_tk)
+
+    valid_mask = mask_tk & ~is_invalid
+    indices_clamped = tl.maximum(indices, 0)
+
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
+
+    block_idx_64 = block_idx.to(tl.int64)
+    offset_in_block_64 = offset_in_block.to(tl.int64)
+
+    kv_base_ptrs = KV_Cache + block_idx_64 * stride_kv_block + offset_in_block_64 * stride_kv_token
+
+    t_idx_64 = t_idx.to(tl.int64)
+    k_idx_64 = k_idx.to(tl.int64)
+    out_base_ptrs = OutputKV + t_idx_64 * stride_out_t + (k_idx_64 + k_offset) * stride_out_k
+
+    for tile_idx in range(NUM_TILES):
+        tile_start = tile_idx * TILE_SIZE
+
+        scale_byte_offset = D_NOPE + tile_idx * 4
+        scale_b0_ptrs = kv_base_ptrs + scale_byte_offset
+        scale_b1_ptrs = kv_base_ptrs + scale_byte_offset + 1
+        scale_b2_ptrs = kv_base_ptrs + scale_byte_offset + 2
+        scale_b3_ptrs = kv_base_ptrs + scale_byte_offset + 3
+
+        scale_b0 = tl.load(scale_b0_ptrs, mask=valid_mask, other=0)
+        scale_b1 = tl.load(scale_b1_ptrs, mask=valid_mask, other=0)
+        scale_b2 = tl.load(scale_b2_ptrs, mask=valid_mask, other=0)
+        scale_b3 = tl.load(scale_b3_ptrs, mask=valid_mask, other=0)
+
+        scale_uint32 = (scale_b0.to(tl.uint32) |
+                       (scale_b1.to(tl.uint32) << 8) |
+                       (scale_b2.to(tl.uint32) << 16) |
+                       (scale_b3.to(tl.uint32) << 24))
+        scale_f32 = scale_uint32.to(tl.float32, bitcast=True)
+
+        for chunk in range(2):
+            chunk_start = tile_start + chunk * 64
+            offs_d = tl.arange(0, 64)
+
+            nope_ptrs = kv_base_ptrs[:, None] + chunk_start + offs_d[None, :]
+            nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+
+            nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+            nope_f32 = nope_fp8.to(tl.float32)
+
+            dequant = nope_f32 * scale_f32[:, None]
+            dequant = tl.where(dequant != dequant, 0.0, dequant)
+            dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+            dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+
+            out_ptrs = out_base_ptrs[:, None] + (chunk_start + offs_d[None, :]) * stride_out_d
+            tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    rope_byte_offset = D_NOPE + NUM_TILES * 4
+    offs_rope = tl.arange(0, D_ROPE)
+
+    rope_lo_ptrs = kv_base_ptrs[:, None] + rope_byte_offset + offs_rope[None, :] * 2
+    rope_hi_ptrs = kv_base_ptrs[:, None] + rope_byte_offset + offs_rope[None, :] * 2 + 1
+
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+
+    rope_uint16 = rope_lo | (rope_hi << 8)
+    rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
+    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+
+    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+
+
+def gather_dequant_fp8_model1_fused_mask(
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    block_size: int,
+    output_kv: torch.Tensor,
+    output_mask: torch.Tensor,
+    k_offset: int,
+    s_q: int,
+) -> bool:
+    """MODEL1 gather+dequant with fused topk_length mask. Returns True if Triton was used."""
+    total_tokens, topk = indices.shape
+    d_qk = MODEL1_D_QK
+
+    max_offset = (total_tokens - 1) * output_kv.stride(0) + (topk + k_offset - 1) * output_kv.stride(1)
+    if max_offset > 2**31 - 1:
+        return False
+
+    num_blocks = kv_cache_quantized.shape[0]
+
+    kv_uint8 = kv_cache_quantized.view(torch.uint8)
+    bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
+    kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
+
+    stride_kv_block = kv_uint8.stride(0)
+    workload_size_cat = _get_workload_size_category(total_tokens, topk)
+
+    grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
+
+    topk_length_tensor = topk_length if topk_length is not None else output_mask[:1, 0]
+
+    _gather_dequant_model1_fused_mask_kernel[grid](
+        kv_flat,
+        indices,
+        topk_length_tensor,
+        output_kv,
+        output_mask,
+        total_tokens,
+        topk,
+        num_blocks,
+        block_size,
+        workload_size_cat,
+        k_offset,
+        s_q,
+        stride_kv_block,
+        indices.stride(0), indices.stride(1),
+        output_kv.stride(0), output_kv.stride(1), output_kv.stride(2),
+        output_mask.stride(0), output_mask.stride(1),
+        D_NOPE=MODEL1_D_NOPE,
+        D_ROPE=MODEL1_D_ROPE,
+        BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
+        BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
+        TILE_SIZE=MODEL1_TILE_SIZE,
+        HAS_TOPK_LENGTH=topk_length is not None,
+    )
+    return True
+
+
+def gather_dequant_fp8_v32_fused_mask(
+    kv_cache_quantized: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    block_size: int,
+    output_kv: torch.Tensor,
+    output_mask: torch.Tensor,
+    k_offset: int,
+    s_q: int,
+) -> bool:
+    """V32 gather+dequant with fused topk_length mask. Returns True if Triton was used."""
+    total_tokens, topk = indices.shape
+    d_qk = V32_D_QK
+
+    max_offset = (total_tokens - 1) * output_kv.stride(0) + (topk + k_offset - 1) * output_kv.stride(1)
+    if max_offset > 2**31 - 1:
+        return False
+
+    num_blocks = kv_cache_quantized.shape[0]
+
+    kv_uint8 = kv_cache_quantized.view(torch.uint8)
+
+    stride_kv_block = kv_uint8.stride(0)
+    stride_kv_token = kv_uint8.stride(1)
+    workload_size_cat = _get_workload_size_category(total_tokens, topk)
+
+    grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
+
+    topk_length_tensor = topk_length if topk_length is not None else output_mask[:1, 0]
+
+    _gather_dequant_v32_fused_mask_kernel[grid](
+        kv_uint8,
+        indices,
+        topk_length_tensor,
+        output_kv,
+        output_mask,
+        total_tokens,
+        topk,
+        num_blocks,
+        block_size,
+        workload_size_cat,
+        k_offset,
+        s_q,
+        stride_kv_block, stride_kv_token,
+        indices.stride(0), indices.stride(1),
+        output_kv.stride(0), output_kv.stride(1), output_kv.stride(2),
+        output_mask.stride(0), output_mask.stride(1),
+        D_NOPE=V32_D_NOPE,
+        D_ROPE=V32_D_ROPE,
+        TILE_SIZE=V32_TILE_SIZE,
+        NUM_TILES=V32_NUM_TILES,
+        HAS_TOPK_LENGTH=topk_length is not None,
+    )
+    return True
 
 # ============================================================================
 # Fused Gather+Dequant+Mask Kernels (computes indices==-1 mask and writes to output)
@@ -1188,98 +1572,151 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
     return output.to(torch.bfloat16), lse
 
 
+
 def triton_sparse_attn_decode(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
     d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized sparse attention decode with unified buffer for main+extra KV."""
+    """Optimized sparse attention decode with unified buffer for main+extra KV.
+
+    Version 8.0: Reduced Python overhead by fusing topk_length mask computation into Triton kernels.
+    Uses fused kernel only when topk_length is present to avoid overhead for common case.
+    """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
     total_tokens = b * s_q
 
-    # Get topk values for both scopes
     topk_main = kv_scope.indices_in_kvcache.size(-1)
     topk_extra = extra_kv_scope.indices_in_kvcache.size(-1) if extra_kv_scope is not None else 0
     total_topk = topk_main + topk_extra
 
-    # Allocate unified buffer for KV and mask
     gathered_kv = torch.empty(total_tokens, total_topk, d_qk, dtype=torch.bfloat16, device=q.device)
     invalid_mask = torch.empty(total_tokens, total_topk, dtype=torch.bool, device=q.device)
 
-    def process_kv_scope_to_buffer(scope, k_offset):
-        """Process KV scope and write to unified buffer at given offset (with fused mask computation)."""
-        topk = scope.indices_in_kvcache.size(-1)
-        block_size = scope.blocked_k.shape[1]
-        indices_reshaped = scope.indices_in_kvcache.reshape(total_tokens, topk)
+    # Process main scope
+    block_size_main = kv_scope.blocked_k.shape[1]
+    indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
 
-        # Use fused mask computation for quantized KV (computes indices==-1 and writes mask)
-        if scope.blocked_k_quantized is not None:
+    if kv_scope.blocked_k_quantized is not None:
+        # Use fused kernel with topk_length only when topk_length is present
+        if kv_scope.topk_length is not None:
             used_triton = False
             if d_qk == 576:
-                used_triton = gather_dequant_fp8_v32_write_mask(scope.blocked_k_quantized, indices_reshaped, block_size, gathered_kv, invalid_mask, k_offset)
+                used_triton = gather_dequant_fp8_v32_fused_mask(
+                    kv_scope.blocked_k_quantized, indices_main, kv_scope.topk_length,
+                    block_size_main, gathered_kv, invalid_mask, 0, s_q)
             elif d_qk == 512:
-                used_triton = gather_dequant_fp8_model1_write_mask(scope.blocked_k_quantized, indices_reshaped, block_size, gathered_kv, invalid_mask, k_offset)
+                used_triton = gather_dequant_fp8_model1_fused_mask(
+                    kv_scope.blocked_k_quantized, indices_main, kv_scope.topk_length,
+                    block_size_main, gathered_kv, invalid_mask, 0, s_q)
             else:
                 raise ValueError(f"Unsupported d_qk: {d_qk}")
 
-            if used_triton:
-                # Handle topk_length separately if present
-                if scope.topk_length is not None:
-                    topk_length_mask = (
-                        torch.arange(0, topk, device=q.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
-                        >= scope.topk_length.view(b, 1, 1)
-                    ).reshape(total_tokens, topk)
-                    invalid_mask[:, k_offset:k_offset+topk] |= topk_length_mask
-            else:
-                # Fallback for large outputs: use original path with PyTorch mask computation
-                scope_invalid_mask = indices_reshaped == -1
-                if scope.topk_length is not None:
-                    scope_invalid_mask = scope_invalid_mask | (
-                        torch.arange(0, topk, device=q.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
-                        >= scope.topk_length.view(b, 1, 1)
-                    ).reshape(total_tokens, topk)
-
-                invalid_mask[:, k_offset:k_offset+topk] = scope_invalid_mask
-
-                # Use the original gather functions which have proper fallback
+            if not used_triton:
+                # Fallback path
+                scope_invalid_mask = indices_main == -1
+                topk_length_mask = (
+                    torch.arange(0, topk_main, device=q.device).view(1, 1, topk_main).broadcast_to(b, s_q, topk_main)
+                    >= kv_scope.topk_length.view(b, 1, 1)
+                ).reshape(total_tokens, topk_main)
+                scope_invalid_mask = scope_invalid_mask | topk_length_mask
+                invalid_mask[:, :topk_main] = scope_invalid_mask
                 if d_qk == 576:
-                    gather_dequant_fp8_v32(scope.blocked_k_quantized, indices_reshaped, scope_invalid_mask, block_size, gathered_kv, k_offset)
+                    gather_dequant_fp8_v32(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
                 elif d_qk == 512:
-                    gather_dequant_fp8_model1(scope.blocked_k_quantized, indices_reshaped, scope_invalid_mask, block_size, gathered_kv, k_offset)
+                    gather_dequant_fp8_model1(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
         else:
-            # Fallback for non-quantized KV: compute mask in PyTorch
-            scope_invalid_mask = indices_reshaped == -1
-            if scope.topk_length is not None:
-                scope_invalid_mask = scope_invalid_mask | (
-                    torch.arange(0, topk, device=q.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
-                    >= scope.topk_length.view(b, 1, 1)
-                ).reshape(total_tokens, topk)
+            # Use original kernel without topk_length (faster for common case)
+            used_triton = False
+            if d_qk == 576:
+                used_triton = gather_dequant_fp8_v32_write_mask(kv_scope.blocked_k_quantized, indices_main, block_size_main, gathered_kv, invalid_mask, 0)
+            elif d_qk == 512:
+                used_triton = gather_dequant_fp8_model1_write_mask(kv_scope.blocked_k_quantized, indices_main, block_size_main, gathered_kv, invalid_mask, 0)
+            else:
+                raise ValueError(f"Unsupported d_qk: {d_qk}")
 
-            invalid_mask[:, k_offset:k_offset+topk] = scope_invalid_mask
-
-            indices_clamped = torch.clamp(indices_reshaped, min=0)
-            kv_gathered = scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk, d_qk).to(torch.bfloat16)
-            kv_gathered[scope_invalid_mask] = 0
-            gathered_kv[:, k_offset:k_offset+topk, :] = kv_gathered
-
-        return topk
-
-    # Process main scope
-    process_kv_scope_to_buffer(kv_scope, 0)
+            if not used_triton:
+                scope_invalid_mask = indices_main == -1
+                invalid_mask[:, :topk_main] = scope_invalid_mask
+                if d_qk == 576:
+                    gather_dequant_fp8_v32(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
+                elif d_qk == 512:
+                    gather_dequant_fp8_model1(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
+    else:
+        scope_invalid_mask = indices_main == -1
+        if kv_scope.topk_length is not None:
+            topk_length_mask = (
+                torch.arange(0, topk_main, device=q.device).view(1, 1, topk_main).broadcast_to(b, s_q, topk_main)
+                >= kv_scope.topk_length.view(b, 1, 1)
+            ).reshape(total_tokens, topk_main)
+            scope_invalid_mask = scope_invalid_mask | topk_length_mask
+        invalid_mask[:, :topk_main] = scope_invalid_mask
+        indices_clamped = torch.clamp(indices_main, min=0)
+        kv_gathered = kv_scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk_main, d_qk).to(torch.bfloat16)
+        kv_gathered[scope_invalid_mask] = 0
+        gathered_kv[:, :topk_main, :] = kv_gathered
 
     # Process extra scope if present
     if extra_kv_scope is not None:
-        process_kv_scope_to_buffer(extra_kv_scope, topk_main)
+        block_size_extra = extra_kv_scope.blocked_k.shape[1]
+        indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra)
 
-    # NaN values are now handled directly in gather kernels - no need for nan_to_num
+        if extra_kv_scope.blocked_k_quantized is not None:
+            if extra_kv_scope.topk_length is not None:
+                used_triton = False
+                if d_qk == 576:
+                    used_triton = gather_dequant_fp8_v32_fused_mask(
+                        extra_kv_scope.blocked_k_quantized, indices_extra, extra_kv_scope.topk_length,
+                        block_size_extra, gathered_kv, invalid_mask, topk_main, s_q)
+                elif d_qk == 512:
+                    used_triton = gather_dequant_fp8_model1_fused_mask(
+                        extra_kv_scope.blocked_k_quantized, indices_extra, extra_kv_scope.topk_length,
+                        block_size_extra, gathered_kv, invalid_mask, topk_main, s_q)
+
+                if not used_triton:
+                    scope_invalid_mask = indices_extra == -1
+                    topk_length_mask = (
+                        torch.arange(0, topk_extra, device=q.device).view(1, 1, topk_extra).broadcast_to(b, s_q, topk_extra)
+                        >= extra_kv_scope.topk_length.view(b, 1, 1)
+                    ).reshape(total_tokens, topk_extra)
+                    scope_invalid_mask = scope_invalid_mask | topk_length_mask
+                    invalid_mask[:, topk_main:] = scope_invalid_mask
+                    if d_qk == 576:
+                        gather_dequant_fp8_v32(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+                    elif d_qk == 512:
+                        gather_dequant_fp8_model1(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+            else:
+                used_triton = False
+                if d_qk == 576:
+                    used_triton = gather_dequant_fp8_v32_write_mask(extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, gathered_kv, invalid_mask, topk_main)
+                elif d_qk == 512:
+                    used_triton = gather_dequant_fp8_model1_write_mask(extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, gathered_kv, invalid_mask, topk_main)
+
+                if not used_triton:
+                    scope_invalid_mask = indices_extra == -1
+                    invalid_mask[:, topk_main:] = scope_invalid_mask
+                    if d_qk == 576:
+                        gather_dequant_fp8_v32(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+                    elif d_qk == 512:
+                        gather_dequant_fp8_model1(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+        else:
+            scope_invalid_mask = indices_extra == -1
+            if extra_kv_scope.topk_length is not None:
+                topk_length_mask = (
+                    torch.arange(0, topk_extra, device=q.device).view(1, 1, topk_extra).broadcast_to(b, s_q, topk_extra)
+                    >= extra_kv_scope.topk_length.view(b, 1, 1)
+                ).reshape(total_tokens, topk_extra)
+                scope_invalid_mask = scope_invalid_mask | topk_length_mask
+            invalid_mask[:, topk_main:] = scope_invalid_mask
+            indices_clamped = torch.clamp(indices_extra, min=0)
+            kv_gathered = extra_kv_scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk_extra, d_qk).to(torch.bfloat16)
+            kv_gathered[scope_invalid_mask] = 0
+            gathered_kv[:, topk_main:, :] = kv_gathered
 
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
-
-    assert gathered_kv.is_contiguous(), "gathered_kv should be contiguous"
-    assert invalid_mask.is_contiguous(), "invalid_mask should be contiguous"
 
     if total_topk <= 8192:
         output, lse = _run_unified_attention(
