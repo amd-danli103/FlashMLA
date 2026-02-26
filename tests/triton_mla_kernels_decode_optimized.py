@@ -156,6 +156,10 @@ def _gather_dequant_model1_kernel(
         nope_bf16 = nope_fp8.to(tl.bfloat16)
 
         dequant = nope_bf16 * scale_bf16[:, None]
+        # Handle NaN and clamp to safe range (eliminates nan_to_num call)
+        # Clamp to 65504 to prevent overflow in attention dot product
+        dequant = tl.where(dequant != dequant, 0.0, dequant)  # NaN -> 0
+        dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)  # Clamp
         dequant = tl.where(is_invalid[:, None], 0.0, dequant)
 
         out_ptrs = out_base_ptrs[:, None] + (tile_start + offs_d[None, :]) * stride_out_d
@@ -173,6 +177,9 @@ def _gather_dequant_model1_kernel(
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    # Handle NaN and clamp to safe range (eliminates nan_to_num call)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)  # NaN -> 0
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)  # Clamp
     rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
 
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
@@ -331,6 +338,9 @@ def _gather_dequant_v32_kernel(
             nope_f32 = nope_fp8.to(tl.float32)
 
             dequant = nope_f32 * scale_f32[:, None]
+            # Handle NaN and clamp to safe range (eliminates nan_to_num call)
+            dequant = tl.where(dequant != dequant, 0.0, dequant)  # NaN -> 0
+            dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)  # Clamp
             dequant = tl.where(is_invalid[:, None], 0.0, dequant)
 
             out_ptrs = out_base_ptrs[:, None] + (chunk_start + offs_d[None, :]) * stride_out_d
@@ -348,6 +358,9 @@ def _gather_dequant_v32_kernel(
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    # Handle NaN and clamp to safe range (eliminates nan_to_num call)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)  # NaN -> 0
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)  # Clamp
     rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
 
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
@@ -877,8 +890,7 @@ def triton_sparse_attn_decode(
     if extra_kv_scope is not None:
         process_kv_scope_to_buffer(extra_kv_scope, topk_main)
 
-    # Clean NaN values
-    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0)
+    # NaN values are now handled directly in gather kernels - no need for nan_to_num
 
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 
