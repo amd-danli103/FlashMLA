@@ -1,15 +1,16 @@
 """
-Optimized Triton MLA Decode Kernels - Version 5.5
+Optimized Triton MLA Decode Kernels - Version 6.0
 
 Key optimizations:
 1. Fused Triton kernel for gather+dequant (significantly faster than PyTorch)
-2. Process both KV scopes in single attention kernel
-3. Minimize memory allocations
-4. Autotuned block sizes for different configurations
-5. Fixed 64-bit pointer arithmetic to avoid overflow with large KV caches
-6. Correct handling of MODEL1 block-level layout
-7. PyTorch fallback for large outputs to avoid int32 pointer overflow
-8. Enhanced autotune with workload size categories for gather-dequant kernels
+2. Unified buffer for main+extra KV to avoid torch.cat overhead
+3. Single unified attention kernel for both scopes
+4. Minimize memory allocations
+5. Autotuned block sizes for different configurations
+6. Fixed 64-bit pointer arithmetic to avoid overflow with large KV caches
+7. Correct handling of MODEL1 block-level layout
+8. PyTorch fallback for large outputs to avoid int32 pointer overflow
+9. Enhanced autotune with workload size categories for gather-dequant kernels
 """
 
 import torch
@@ -18,11 +19,6 @@ import triton.language as tl
 from typing import Optional, Tuple
 
 LOG2E = tl.constexpr(1.4426950408889634)
-
-# Block sizes for attention kernel
-# BLOCK_H = 16  # Now controlled by autotune
-# BLOCK_N = 64  # Now controlled by autotune
-# BLOCK_D = 128  # Now controlled by autotune
 
 # Constants for MODEL1 layout
 MODEL1_D_QK = 512
@@ -65,21 +61,18 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
         return 3
 
 # ============================================================================
-# Optimized Gather+Dequant Kernels
+# Optimized Gather+Dequant Kernels with Offset Support
 # ============================================================================
 
 @triton.autotune(
     configs=[
-        # Small workloads - smaller blocks, fewer warps
         triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
-        # Medium workloads
         triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
-        # Large workloads - larger blocks, more warps
         triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
     ],
@@ -87,7 +80,6 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
 )
 @triton.jit
 def _gather_dequant_model1_kernel(
-    # KV cache is flattened to [num_blocks, bytes_per_block]
     KV_Cache,
     Indices,
     InvalidMask,
@@ -96,8 +88,9 @@ def _gather_dequant_model1_kernel(
     topk,
     num_blocks,
     block_size,
-    workload_size_cat,  # Workload size category for autotune
-    stride_kv_block,  # Stride between blocks (in bytes)
+    workload_size_cat,
+    k_offset,  # Offset in the K dimension for unified buffer
+    stride_kv_block,
     stride_idx_t, stride_idx_k,
     stride_mask_t, stride_mask_k,
     stride_out_t, stride_out_k, stride_out_d,
@@ -108,19 +101,7 @@ def _gather_dequant_model1_kernel(
     BYTES_PER_TOKEN_SCALE: tl.constexpr,
     TILE_SIZE: tl.constexpr,
 ):
-    """
-    Fused gather + dequant kernel for MODEL1 layout.
-
-    MODEL1 block layout:
-    [token0_nope_rope (576B)][token1_nope_rope (576B)]...[tokenN_nope_rope (576B)]
-    [token0_scales (8B)][token1_scales (8B)]...[tokenN_scales (8B)]
-
-    Per-token nope_rope layout (576 bytes):
-    [nope (448 FP8)][rope (128 bytes = 64 bf16)]
-
-    Per-token scales layout (8 bytes):
-    [7 E8M0 scales][1 padding]
-    """
+    """Fused gather + dequant kernel for MODEL1 layout with offset support."""
     pid = tl.program_id(0)
     num_tk = total_tokens * topk
 
@@ -142,44 +123,32 @@ def _gather_dequant_model1_kernel(
     block_idx = indices_clamped // block_size
     offset_in_block = indices_clamped % block_size
 
-    # Use 64-bit arithmetic to avoid overflow
-    # Convert tensor values to int64, then multiply by scalar strides
-    # The multiplication of int64 tensor with Python int produces int64 result
     block_idx_64 = block_idx.to(tl.int64)
     offset_in_block_64 = offset_in_block.to(tl.int64)
 
-    # Base pointer for each block (block_idx_64 * stride_kv_block is int64)
     kv_block_base = KV_Cache + block_idx_64 * stride_kv_block
 
-    # Compute byte offsets within block
-    # nope_rope data: offset_in_block * BYTES_PER_TOKEN_DATA
-    # scales: block_size * BYTES_PER_TOKEN_DATA + offset_in_block * BYTES_PER_TOKEN_SCALE
     nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
     scale_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-    # Use 64-bit arithmetic for output pointers to avoid overflow with large topk
-    # Convert tensor indices to int64 first, then multiply by scalar strides
-    # The multiplication of int64 tensor with Python int produces int64 result
     t_idx_64 = t_idx.to(tl.int64)
     k_idx_64 = k_idx.to(tl.int64)
-    out_base_ptrs = Output + t_idx_64 * stride_out_t + k_idx_64 * stride_out_k
+    # Apply k_offset for unified buffer
+    out_base_ptrs = Output + t_idx_64 * stride_out_t + (k_idx_64 + k_offset) * stride_out_k
 
     # Process 7 tiles of nope (each 64 FP8 elements)
     for tile_idx in range(7):
         tile_start = tile_idx * TILE_SIZE
 
-        # Load scale for this tile (E8M0 format)
         scale_ptrs = kv_block_base + scale_offset + tile_idx
         scale_uint8 = tl.load(scale_ptrs, mask=valid_mask, other=127).to(tl.uint8)
 
-        # E8M0 to float: 2^(val - 127)
         scale_exp = scale_uint8.to(tl.float32) - 127.0
         scale_f32 = tl.math.exp2(scale_exp)
         scale_bf16 = scale_f32.to(tl.bfloat16)
 
         offs_d = tl.arange(0, TILE_SIZE)
 
-        # Load nope data (FP8)
         nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start + offs_d[None, :]
         nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
 
@@ -194,7 +163,7 @@ def _gather_dequant_model1_kernel(
 
     # Process rope (64 bf16 values = 128 bytes)
     offs_rope = tl.arange(0, D_ROPE)
-    rope_byte_start = D_NOPE  # rope starts after nope in per-token data
+    rope_byte_start = D_NOPE
 
     rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
     rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
@@ -209,28 +178,29 @@ def _gather_dequant_model1_kernel(
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
+
 def gather_dequant_fp8_model1_triton(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """Triton implementation of gather+dequant for MODEL1 layout."""
+    """Triton implementation of gather+dequant for MODEL1 layout with offset support."""
     total_tokens, topk = indices.shape
     device = kv_cache_quantized.device
     num_blocks = kv_cache_quantized.shape[0]
 
-    # View as uint8 and flatten to [num_blocks, bytes_per_block]
     kv_uint8 = kv_cache_quantized.view(torch.uint8)
     bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
     kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
 
-    # Get the actual stride between blocks (handles padding)
     stride_kv_block = kv_uint8.stride(0)
 
-    output = torch.empty(total_tokens, topk, MODEL1_D_QK, dtype=torch.bfloat16, device=device)
+    if output is None:
+        output = torch.empty(total_tokens, topk, MODEL1_D_QK, dtype=torch.bfloat16, device=device)
 
-    # Compute workload size category for autotune
     workload_size_cat = _get_workload_size_category(total_tokens, topk)
 
     grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
@@ -245,6 +215,7 @@ def gather_dequant_fp8_model1_triton(
         num_blocks,
         block_size,
         workload_size_cat,
+        k_offset,
         stride_kv_block,
         indices.stride(0), indices.stride(1),
         invalid_mask.stride(0), invalid_mask.stride(1),
@@ -258,18 +229,16 @@ def gather_dequant_fp8_model1_triton(
 
     return output
 
+
 @triton.autotune(
     configs=[
-        # Small workloads - smaller blocks, fewer warps
         triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
-        # Medium workloads
         triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
-        # Large workloads - larger blocks, more warps
         triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
     ],
@@ -277,7 +246,6 @@ def gather_dequant_fp8_model1_triton(
 )
 @triton.jit
 def _gather_dequant_v32_kernel(
-    # KV cache with shape [num_blocks, block_size, bytes_per_token]
     KV_Cache,
     Indices,
     InvalidMask,
@@ -286,7 +254,8 @@ def _gather_dequant_v32_kernel(
     topk,
     num_blocks,
     block_size,
-    workload_size_cat,  # Workload size category for autotune
+    workload_size_cat,
+    k_offset,  # Offset in the K dimension for unified buffer
     stride_kv_block,
     stride_kv_token,
     stride_idx_t, stride_idx_k,
@@ -298,12 +267,7 @@ def _gather_dequant_v32_kernel(
     TILE_SIZE: tl.constexpr,
     NUM_TILES: tl.constexpr,
 ):
-    """
-    Fused gather + dequant kernel for V32 layout.
-
-    V32 per-token layout (656 bytes):
-    [nope (512 FP8)][scales (16 bytes = 4 f32)][rope (128 bytes = 64 bf16)]
-    """
+    """Fused gather + dequant kernel for V32 layout with offset support."""
     pid = tl.program_id(0)
     num_tk = total_tokens * topk
 
@@ -325,27 +289,20 @@ def _gather_dequant_v32_kernel(
     block_idx = indices_clamped // block_size
     offset_in_block = indices_clamped % block_size
 
-    # Use 64-bit arithmetic to avoid overflow
-    # Convert tensor values to int64, then multiply by scalar strides
-    # The multiplication of int64 tensor with Python int produces int64 result
     block_idx_64 = block_idx.to(tl.int64)
     offset_in_block_64 = offset_in_block.to(tl.int64)
 
-    # Compute KV base pointers (all multiplications are int64 * Python int = int64)
     kv_base_ptrs = KV_Cache + block_idx_64 * stride_kv_block + offset_in_block_64 * stride_kv_token
 
-    # Use 64-bit arithmetic for output pointers to avoid overflow with large topk
-    # Convert tensor indices to int64 first, then multiply by scalar strides
-    # The multiplication of int64 tensor with Python int produces int64 result
     t_idx_64 = t_idx.to(tl.int64)
     k_idx_64 = k_idx.to(tl.int64)
-    out_base_ptrs = Output + t_idx_64 * stride_out_t + k_idx_64 * stride_out_k
+    # Apply k_offset for unified buffer
+    out_base_ptrs = Output + t_idx_64 * stride_out_t + (k_idx_64 + k_offset) * stride_out_k
 
     # Process 4 tiles of nope (each 128 FP8 elements)
     for tile_idx in range(NUM_TILES):
         tile_start = tile_idx * TILE_SIZE
 
-        # Load scale (f32) - 4 bytes per scale
         scale_byte_offset = D_NOPE + tile_idx * 4
         scale_b0_ptrs = kv_base_ptrs + scale_byte_offset
         scale_b1_ptrs = kv_base_ptrs + scale_byte_offset + 1
@@ -363,7 +320,6 @@ def _gather_dequant_v32_kernel(
                        (scale_b3.to(tl.uint32) << 24))
         scale_f32 = scale_uint32.to(tl.float32, bitcast=True)
 
-        # Process 128 elements in two chunks of 64
         for chunk in range(2):
             chunk_start = tile_start + chunk * 64
             offs_d = tl.arange(0, 64)
@@ -397,27 +353,28 @@ def _gather_dequant_v32_kernel(
     out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
+
 def gather_dequant_fp8_v32_triton(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """Triton implementation of gather+dequant for V32 layout."""
+    """Triton implementation of gather+dequant for V32 layout with offset support."""
     total_tokens, topk = indices.shape
     device = kv_cache_quantized.device
     num_blocks = kv_cache_quantized.shape[0]
 
-    # View as uint8 - shape is [num_blocks, block_size, 1, bytes_per_token]
     kv_uint8 = kv_cache_quantized.view(torch.uint8)
 
-    # Get strides
     stride_kv_block = kv_uint8.stride(0)
     stride_kv_token = kv_uint8.stride(1)
 
-    output = torch.empty(total_tokens, topk, V32_D_QK, dtype=torch.bfloat16, device=device)
+    if output is None:
+        output = torch.empty(total_tokens, topk, V32_D_QK, dtype=torch.bfloat16, device=device)
 
-    # Compute workload size category for autotune
     workload_size_cat = _get_workload_size_category(total_tokens, topk)
 
     grid = lambda meta: (triton.cdiv(total_tokens * topk, meta['BLOCK_TK']),)
@@ -432,6 +389,7 @@ def gather_dequant_fp8_v32_triton(
         num_blocks,
         block_size,
         workload_size_cat,
+        k_offset,
         stride_kv_block, stride_kv_token,
         indices.stride(0), indices.stride(1),
         invalid_mask.stride(0), invalid_mask.stride(1),
@@ -453,8 +411,10 @@ def gather_dequant_fp8_model1_fast(
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """Optimized PyTorch MODEL1 gather+dequant."""
+    """Optimized PyTorch MODEL1 gather+dequant with offset support."""
     d_qk = 512
     d_nope = 448
     d_rope = 64
@@ -496,20 +456,28 @@ def gather_dequant_fp8_model1_fast(
     scales_expanded = scales_bf16.view(total_tokens, topk, num_tiles, 1).expand(
         total_tokens, topk, num_tiles, tile_size).reshape(total_tokens, topk, d_nope)
 
-    output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
-    output[..., :d_nope] = nope_bf16 * scales_expanded
-    output[..., d_nope:] = gathered_rope
+    if output is None:
+        output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
+        output[..., :d_nope] = nope_bf16 * scales_expanded
+        output[..., d_nope:] = gathered_rope
+        output[invalid_mask] = 0
+    else:
+        output[:, k_offset:k_offset+topk, :d_nope] = nope_bf16 * scales_expanded
+        output[:, k_offset:k_offset+topk, d_nope:] = gathered_rope
+        output[:, k_offset:k_offset+topk][invalid_mask] = 0
 
-    output[invalid_mask] = 0
     return output
+
 
 def gather_dequant_fp8_v32_pytorch(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """PyTorch V32 layout gather+dequant."""
+    """PyTorch V32 layout gather+dequant with offset support."""
     d_qk = 576
     d_nope = 512
     d_rope = 64
@@ -536,13 +504,19 @@ def gather_dequant_fp8_v32_pytorch(
     scales = gathered_bytes[..., d_nope:d_nope + num_tiles * 4].contiguous().view(torch.float32)
     rope_bf16 = gathered_bytes[..., d_nope + num_tiles * 4:].contiguous().view(torch.bfloat16)
 
-    output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
     nope_f32 = nope_fp8.to(torch.float32)
     scales_expanded = scales.repeat_interleave(tile_size, dim=-1)
-    output[..., :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
-    output[..., d_nope:] = rope_bf16
 
-    output[invalid_mask] = 0
+    if output is None:
+        output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
+        output[..., :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
+        output[..., d_nope:] = rope_bf16
+        output[invalid_mask] = 0
+    else:
+        output[:, k_offset:k_offset+topk, :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
+        output[:, k_offset:k_offset+topk, d_nope:] = rope_bf16
+        output[:, k_offset:k_offset+topk][invalid_mask] = 0
+
     return output
 
 # ============================================================================
@@ -554,40 +528,40 @@ def gather_dequant_fp8_model1(
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """MODEL1 layout gather+dequant - uses optimized Triton kernel with PyTorch fallback for large outputs."""
+    """MODEL1 layout gather+dequant with offset support."""
     total_tokens, topk = indices.shape
     d_qk = MODEL1_D_QK
 
-    # Check if output would overflow int32 pointer arithmetic
     max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
     if max_offset > 2**31 - 1:
-        # Use PyTorch fallback for large outputs
-        return gather_dequant_fp8_model1_fast(kv_cache_quantized, indices, invalid_mask, block_size)
+        return gather_dequant_fp8_model1_fast(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
-    return gather_dequant_fp8_model1_triton(kv_cache_quantized, indices, invalid_mask, block_size)
+    return gather_dequant_fp8_model1_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
+
 
 def gather_dequant_fp8_v32(
     kv_cache_quantized: torch.Tensor,
     indices: torch.Tensor,
     invalid_mask: torch.Tensor,
     block_size: int,
+    output: torch.Tensor = None,
+    k_offset: int = 0,
 ) -> torch.Tensor:
-    """V32 layout gather+dequant - uses optimized Triton kernel with PyTorch fallback for large outputs."""
+    """V32 layout gather+dequant with offset support."""
     total_tokens, topk = indices.shape
     d_qk = V32_D_QK
 
-    # Check if output would overflow int32 pointer arithmetic
-    # stride_out_t = topk * d_qk, max_offset = (total_tokens-1) * stride_out_t + (topk-1) * d_qk
     max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
     if max_offset > 2**31 - 1:
-        # Use PyTorch fallback for large outputs
-        return gather_dequant_fp8_v32_pytorch(kv_cache_quantized, indices, invalid_mask, block_size)
+        return gather_dequant_fp8_v32_pytorch(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
-    return gather_dequant_fp8_v32_triton(kv_cache_quantized, indices, invalid_mask, block_size)
+    return gather_dequant_fp8_v32_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
 # ============================================================================
-# Attention Kernel
+# Unified Attention Kernel (single buffer for main + extra KV)
 # ============================================================================
 
 @triton.autotune(
@@ -601,42 +575,31 @@ def gather_dequant_fp8_v32(
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 8, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 8, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 8, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32, "BLOCK_D": 128}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=2, num_stages=1),
     ],
-    key=["total_tokens", "h_q", "topk_main", "d_qk"],
+    key=["total_tokens", "h_q", "total_topk", "d_qk"],
 )
 @triton.jit
-def _fused_sparse_decode_kernel_dual_scope(
-    Q,
-    KV_Main, Mask_Main,
-    KV_Extra, Mask_Extra,
-    AttnSink,
+def _unified_sparse_decode_kernel(
+    Q, KV, Mask, AttnSink,
     Output, LSE,
-    sm_scale,
-    total_tokens,
-    h_q,
-    topk_main,
-    topk_extra,
-    d_qk,
-    d_v,
+    sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
     stride_q_t, stride_q_h, stride_q_d,
-    stride_kv_main_t, stride_kv_main_k, stride_kv_main_d,
-    stride_mask_main_t, stride_mask_main_k,
-    stride_kv_extra_t, stride_kv_extra_k, stride_kv_extra_d,
-    stride_mask_extra_t, stride_mask_extra_k,
+    stride_kv_t, stride_kv_k, stride_kv_d,
+    stride_mask_t, stride_mask_k,
     stride_o_t, stride_o_h, stride_o_d,
     stride_lse_t, stride_lse_h,
-    HAS_EXTRA_KV: tl.constexpr,
     HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Fused attention kernel processing both KV scopes."""
+    """Unified attention kernel with single KV buffer."""
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -655,15 +618,14 @@ def _fused_sparse_decode_kernel_dual_scope(
     acc_3 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
     q_base = Q + pid_t * stride_q_t
+    kv_base = KV + pid_t * stride_kv_t
+    mask_base = Mask + pid_t * stride_mask_t
 
-    kv_main_base = KV_Main + pid_t * stride_kv_main_t
-    mask_main_base = Mask_Main + pid_t * stride_mask_main_t
-
-    for n_start in range(0, topk_main, BLOCK_N):
+    for n_start in range(0, total_topk, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < topk_main
+        mask_n = offs_n < total_topk
 
-        mask_ptrs = mask_main_base + offs_n * stride_mask_main_k
+        mask_ptrs = mask_base + offs_n * stride_mask_k
         invalid = tl.load(mask_ptrs, mask=mask_n, other=True)
         valid = mask_n & ~invalid
 
@@ -676,7 +638,7 @@ def _fused_sparse_decode_kernel_dual_scope(
             q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
             q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
 
-            k_ptrs = kv_main_base + offs_n[:, None] * stride_kv_main_k + offs_d[None, :] * stride_kv_main_d
+            k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
 
             qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
@@ -692,86 +654,27 @@ def _fused_sparse_decode_kernel_dual_scope(
         p_bf16 = p.to(tl.bfloat16)
 
         offs_v = tl.arange(0, BLOCK_D)
-        v_ptrs = kv_main_base + offs_n[:, None] * stride_kv_main_k + offs_v[None, :] * stride_kv_main_d
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
         acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
-        v_ptrs = kv_main_base + offs_n[:, None] * stride_kv_main_k + offs_v[None, :] * stride_kv_main_d
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
         acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
-        v_ptrs = kv_main_base + offs_n[:, None] * stride_kv_main_k + offs_v[None, :] * stride_kv_main_d
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
         acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
-        v_ptrs = kv_main_base + offs_n[:, None] * stride_kv_main_k + offs_v[None, :] * stride_kv_main_d
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
         acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
 
         m_i = m_new
         l_i = l_new
-
-    if HAS_EXTRA_KV:
-        kv_extra_base = KV_Extra + pid_t * stride_kv_extra_t
-        mask_extra_base = Mask_Extra + pid_t * stride_mask_extra_t
-
-        for n_start in range(0, topk_extra, BLOCK_N):
-            offs_n = n_start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < topk_extra
-
-            mask_ptrs = mask_extra_base + offs_n * stride_mask_extra_k
-            invalid = tl.load(mask_ptrs, mask=mask_n, other=True)
-            valid = mask_n & ~invalid
-
-            qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-
-            for d_start in range(0, d_qk, BLOCK_D):
-                offs_d = d_start + tl.arange(0, BLOCK_D)
-                mask_d = offs_d < d_qk
-
-                q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
-                q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
-
-                k_ptrs = kv_extra_base + offs_n[:, None] * stride_kv_extra_k + offs_d[None, :] * stride_kv_extra_d
-                k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
-
-                qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
-
-            qk = qk * sm_scale
-            qk = tl.where(valid[None, :], qk, NEG_INF)
-
-            m_ij = tl.max(qk, axis=1)
-            m_new = tl.maximum(m_i, m_ij)
-            alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
-            p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-            l_new = alpha * l_i + tl.sum(p, axis=1)
-            p_bf16 = p.to(tl.bfloat16)
-
-            offs_v = tl.arange(0, BLOCK_D)
-            v_ptrs = kv_extra_base + offs_n[:, None] * stride_kv_extra_k + offs_v[None, :] * stride_kv_extra_d
-            v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
-            acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
-
-            offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
-            v_ptrs = kv_extra_base + offs_n[:, None] * stride_kv_extra_k + offs_v[None, :] * stride_kv_extra_d
-            v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-            acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
-
-            offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
-            v_ptrs = kv_extra_base + offs_n[:, None] * stride_kv_extra_k + offs_v[None, :] * stride_kv_extra_d
-            v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-            acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
-
-            offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
-            v_ptrs = kv_extra_base + offs_n[:, None] * stride_kv_extra_k + offs_v[None, :] * stride_kv_extra_d
-            v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-            acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
-
-            m_i = m_new
-            l_i = l_new
 
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = (l_i == 0.0)
@@ -803,71 +706,40 @@ def _fused_sparse_decode_kernel_dual_scope(
     offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
     tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
 
-def _run_dual_scope_attention(q_reshaped, kv_main, mask_main, kv_extra, mask_extra,
-                               d_v, sm_scale, total_tokens, h_q, topk_main, topk_extra, d_qk,
-                               attn_sink=None):
+
+def _run_unified_attention(q_reshaped, gathered_kv, invalid_mask,
+                           d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+                           attn_sink=None):
+    """Run unified attention with single KV buffer."""
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
 
     grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
-    HAS_EXTRA_KV = kv_extra is not None
     HAS_ATTN_SINK = attn_sink is not None
-
-    # Optimization: Reuse existing tensors instead of allocating dummy tensors
-    # When HAS_EXTRA_KV=False, the kernel never accesses kv_extra/mask_extra
-    # When HAS_ATTN_SINK=False, the kernel never accesses attn_sink_tensor
-    # So we can safely reuse kv_main/mask_main as placeholders to avoid allocator pressure
-    if not HAS_EXTRA_KV:
-        kv_extra = kv_main  # Reuse kv_main as placeholder (not accessed when HAS_EXTRA_KV=False)
-        mask_extra = mask_main  # Reuse mask_main as placeholder
-        topk_extra = 0
-
-    # Reuse lse tensor as placeholder for attn_sink when not needed (lse is already float32)
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
-    _fused_sparse_decode_kernel_dual_scope[grid](
-        q_reshaped,
-        kv_main, mask_main,
-        kv_extra, mask_extra,
-        attn_sink_tensor,
+    _unified_sparse_decode_kernel[grid](
+        q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
         output, lse,
-        sm_scale, total_tokens, h_q, topk_main, topk_extra, d_qk, d_v,
+        sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
         q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
-        kv_main.stride(0), kv_main.stride(1), kv_main.stride(2),
-        mask_main.stride(0), mask_main.stride(1),
-        kv_extra.stride(0), kv_extra.stride(1), kv_extra.stride(2) if HAS_EXTRA_KV else 1,
-        mask_extra.stride(0), mask_extra.stride(1) if HAS_EXTRA_KV else 1,
+        gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
+        invalid_mask.stride(0), invalid_mask.stride(1),
         output.stride(0), output.stride(1), output.stride(2),
         lse.stride(0), lse.stride(1),
-        HAS_EXTRA_KV=HAS_EXTRA_KV,
         HAS_ATTN_SINK=HAS_ATTN_SINK,
     )
     return output, lse
 
+
 def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
                                    d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
                                    attn_sink=None, chunk_size=8192):
-    """
-    Chunked attention using Triton kernels with cross-chunk softmax merging.
-
-    This implementation matches the behavior of the PyTorch fallback:
-    - For queries with all invalid KV, output is 0 and lse is +inf
-    - Uses LSE-based merging algorithm for normalized outputs
-
-    The kernel returns:
-    - chunk_output: normalized attention output = sum(softmax * V)
-    - chunk_lse: log-sum-exp = log(sum(exp(scores)))
-
-    For merging normalized outputs with LSE values:
-    - lse_new = log(exp(lse_old) + exp(lse_new_chunk))
-    - output_new = output_old * exp(lse_old - lse_new) + output_chunk * exp(lse_chunk - lse_new)
-    """
+    """Chunked attention using Triton kernels with cross-chunk softmax merging."""
     device = q_reshaped.device
 
-    # Calculate number of chunks
     num_chunks = (total_topk + chunk_size - 1) // chunk_size
 
-    # Pre-split the KV and mask into contiguous chunks
     kv_chunks = []
     mask_chunks = []
     chunk_sizes = []
@@ -880,9 +752,6 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         kv_chunks.append(gathered_kv[:, start_k:end_k, :].contiguous())
         mask_chunks.append(invalid_mask[:, start_k:end_k].contiguous())
 
-    # Initialize accumulators
-    # lse_acc: running log-sum-exp (starts at -inf meaning "no valid tokens")
-    # acc: running weighted sum of normalized outputs (weighted by exp(lse))
     lse_acc = torch.full((total_tokens, h_q), float('-inf'), dtype=torch.float32, device=device)
     acc = torch.zeros((total_tokens, h_q, d_v), dtype=torch.float32, device=device)
 
@@ -891,33 +760,20 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         mask_chunk = mask_chunks[chunk_idx]
         chunk_topk = chunk_sizes[chunk_idx]
 
-        # Run Triton kernel for this chunk
-        # The kernel returns:
-        # - chunk_output: normalized attention output (sum of softmax * V)
-        # - chunk_lse: log-sum-exp = log(sum(exp(scores))), or +inf for lonely queries
-        chunk_output, chunk_lse = _run_dual_scope_attention(
+        chunk_output, chunk_lse = _run_unified_attention(
             q_reshaped, kv_chunk, mask_chunk,
-            None, None,
-            d_v, sm_scale, total_tokens, h_q, chunk_topk, 0, d_qk,
+            d_v, sm_scale, total_tokens, h_q, chunk_topk, d_qk,
             attn_sink=None
         )
 
-        # Identify lonely queries in this chunk (lse = +inf means no valid KV)
         is_chunk_lonely = torch.isinf(chunk_lse) & (chunk_lse > 0)
 
-        # For lonely chunks, treat lse as -inf for merging purposes
         chunk_lse_for_merge = torch.where(is_chunk_lonely,
                                           torch.full_like(chunk_lse, float('-inf')),
                                           chunk_lse)
 
-        # Compute the new combined LSE using log-sum-exp trick:
-        # lse_new = log(exp(lse_acc) + exp(chunk_lse))
-        #         = max(lse_acc, chunk_lse) + log(1 + exp(-|lse_acc - chunk_lse|))
-        #         = max(lse_acc, chunk_lse) + log(exp(lse_acc - max) + exp(chunk_lse - max))
         lse_max = torch.maximum(lse_acc, chunk_lse_for_merge)
 
-        # Compute exp(lse_acc - lse_max) and exp(chunk_lse - lse_max)
-        # Handle -inf - (-inf) = nan -> 0
         exp_acc = torch.exp(lse_acc - lse_max)
         exp_acc = torch.where(torch.isnan(exp_acc), torch.zeros_like(exp_acc), exp_acc)
 
@@ -925,17 +781,12 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         exp_chunk = torch.where(torch.isnan(exp_chunk) | is_chunk_lonely,
                                 torch.zeros_like(exp_chunk), exp_chunk)
 
-        # New LSE = max + log(exp_acc + exp_chunk)
         sum_exp = exp_acc + exp_chunk
         lse_new = lse_max + torch.log(torch.where(sum_exp == 0, torch.ones_like(sum_exp), sum_exp))
 
-        # For completely empty case (both -inf), keep -inf
         both_empty = (lse_acc == float('-inf')) & (chunk_lse_for_merge == float('-inf'))
         lse_new = torch.where(both_empty, torch.full_like(lse_new, float('-inf')), lse_new)
 
-        # Compute weights for merging outputs
-        # weight_acc = exp(lse_acc - lse_new)
-        # weight_chunk = exp(chunk_lse - lse_new)
         weight_acc = torch.exp(lse_acc - lse_new)
         weight_acc = torch.where(torch.isnan(weight_acc) | torch.isinf(weight_acc),
                                  torch.zeros_like(weight_acc), weight_acc)
@@ -944,36 +795,24 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         weight_chunk = torch.where(torch.isnan(weight_chunk) | torch.isinf(weight_chunk) | is_chunk_lonely,
                                    torch.zeros_like(weight_chunk), weight_chunk)
 
-        # Update accumulator: acc_new = weight_acc * acc + weight_chunk * chunk_output
         acc = weight_acc.unsqueeze(-1) * acc + weight_chunk.unsqueeze(-1) * chunk_output.float()
 
-        # Update LSE
         lse_acc = lse_new
 
-    # Final output is already normalized (weights sum to 1 when lse values are correct)
     output = acc
     lse = lse_acc
 
-    # Identify lonely queries (lse = -inf means no valid tokens across all chunks)
     is_lonely_final = (lse == float('-inf'))
 
-    # Set lse to +inf for lonely queries (to match reference behavior)
     lse = torch.where(is_lonely_final, torch.full_like(lse, float('+inf')), lse)
 
-    # Apply attention sink if provided
     if attn_sink is not None:
-        # The attention sink adds a virtual token with log-probability = attn_sink
-        # Final output = output * (exp(lse) / (exp(lse) + exp(attn_sink)))
-        #              = output * (1 / (1 + exp(attn_sink - lse)))
-        # For lonely queries (lse = +inf), this becomes 0
         attn_sink_expanded = attn_sink.view(1, h_q)
         exp_diff = torch.exp(attn_sink_expanded - lse)
-        # Handle inf - inf = nan
         exp_diff = torch.where(is_lonely_final, torch.full_like(exp_diff, float('inf')), exp_diff)
         scale = 1.0 / (1.0 + exp_diff)
         output = output * scale.unsqueeze(-1)
 
-    # Set lonely query outputs to 0
     output = torch.where(is_lonely_final.unsqueeze(-1), torch.zeros_like(output), output)
 
     return output.to(torch.bfloat16), lse
@@ -983,86 +822,81 @@ def triton_sparse_attn_decode(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
     d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized sparse attention decode with dual-scope kernel."""
+    """Optimized sparse attention decode with unified buffer for main+extra KV."""
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
     total_tokens = b * s_q
 
-    def process_kv_scope(scope):
-        assert scope.indices_in_kvcache is not None
+    # Get topk values for both scopes
+    topk_main = kv_scope.indices_in_kvcache.size(-1)
+    topk_extra = extra_kv_scope.indices_in_kvcache.size(-1) if extra_kv_scope is not None else 0
+    total_topk = topk_main + topk_extra
+
+    # Allocate unified buffer for KV and mask
+    gathered_kv = torch.empty(total_tokens, total_topk, d_qk, dtype=torch.bfloat16, device=q.device)
+    invalid_mask = torch.empty(total_tokens, total_topk, dtype=torch.bool, device=q.device)
+
+    def process_kv_scope_to_buffer(scope, k_offset):
+        """Process KV scope and write to unified buffer at given offset."""
         topk = scope.indices_in_kvcache.size(-1)
         block_size = scope.blocked_k.shape[1]
-        invalid_mask = scope.indices_in_kvcache == -1
+
+        # Compute invalid mask
+        scope_invalid_mask = scope.indices_in_kvcache == -1
         if scope.topk_length is not None:
-            invalid_mask = invalid_mask | (
+            scope_invalid_mask = scope_invalid_mask | (
                 torch.arange(0, topk, device=q.device).view(1, 1, topk).broadcast_to(b, s_q, topk)
                 >= scope.topk_length.view(b, 1, 1)
             )
         indices_reshaped = scope.indices_in_kvcache.reshape(total_tokens, topk)
-        invalid_mask_reshaped = invalid_mask.reshape(total_tokens, topk)
+        invalid_mask_reshaped = scope_invalid_mask.reshape(total_tokens, topk)
 
+        # Write invalid mask to unified buffer
+        invalid_mask[:, k_offset:k_offset+topk] = invalid_mask_reshaped
+
+        # Gather KV to unified buffer
         if scope.blocked_k_quantized is not None:
             if d_qk == 576:
-                gathered_kv = gather_dequant_fp8_v32(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size)
+                gather_dequant_fp8_v32(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size, gathered_kv, k_offset)
             elif d_qk == 512:
-                gathered_kv = gather_dequant_fp8_model1(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size)
+                gather_dequant_fp8_model1(scope.blocked_k_quantized, indices_reshaped, invalid_mask_reshaped, block_size, gathered_kv, k_offset)
             else:
                 raise ValueError(f"Unsupported d_qk: {d_qk}")
         else:
             indices_clamped = torch.clamp(indices_reshaped, min=0)
-            gathered_kv = scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk, d_qk).to(torch.bfloat16)
-            gathered_kv[invalid_mask_reshaped] = 0
-        return gathered_kv, invalid_mask_reshaped
+            kv_gathered = scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk, d_qk).to(torch.bfloat16)
+            kv_gathered[invalid_mask_reshaped] = 0
+            gathered_kv[:, k_offset:k_offset+topk, :] = kv_gathered
 
-    gathered_kv_main, invalid_mask_main = process_kv_scope(kv_scope)
-    topk_main = gathered_kv_main.shape[1]
+        return topk
 
-    gathered_kv_extra = None
-    invalid_mask_extra = None
-    topk_extra = 0
+    # Process main scope
+    process_kv_scope_to_buffer(kv_scope, 0)
 
+    # Process extra scope if present
     if extra_kv_scope is not None:
-        gathered_kv_extra, invalid_mask_extra = process_kv_scope(extra_kv_scope)
-        topk_extra = gathered_kv_extra.shape[1]
+        process_kv_scope_to_buffer(extra_kv_scope, topk_main)
 
-    # Use nan_to_num for efficient in-place NaN cleaning (avoids zeros_like allocation)
-    gathered_kv_main = torch.nan_to_num(gathered_kv_main, nan=0.0)
-    if gathered_kv_extra is not None:
-        gathered_kv_extra = torch.nan_to_num(gathered_kv_extra, nan=0.0)
+    # Clean NaN values
+    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0)
 
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 
-    # Ensure q_reshaped is contiguous (input q may have non-standard layout)
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
 
-    # Assert contiguity for tensors that should always be contiguous
-    assert gathered_kv_main.is_contiguous(), "gathered_kv_main should be contiguous"
-    assert invalid_mask_main.is_contiguous(), "invalid_mask_main should be contiguous"
-    if gathered_kv_extra is not None:
-        assert gathered_kv_extra.is_contiguous(), "gathered_kv_extra should be contiguous"
-        assert invalid_mask_extra.is_contiguous(), "invalid_mask_extra should be contiguous"
-
-    total_topk = topk_main + topk_extra
+    assert gathered_kv.is_contiguous(), "gathered_kv should be contiguous"
+    assert invalid_mask.is_contiguous(), "invalid_mask should be contiguous"
 
     if total_topk <= 8192:
-        output, lse = _run_dual_scope_attention(
-            q_reshaped, gathered_kv_main, invalid_mask_main,
-            gathered_kv_extra, invalid_mask_extra,
-            d_v, sm_scale, total_tokens, h_q, topk_main, topk_extra, d_qk,
+        output, lse = _run_unified_attention(
+            q_reshaped, gathered_kv, invalid_mask,
+            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
             attn_sink=attn_sink
         )
     else:
-        # Use chunked Triton attention for large topk
-        if gathered_kv_extra is not None:
-            gathered_kv = torch.cat([gathered_kv_main, gathered_kv_extra], dim=1)
-            invalid_mask_combined = torch.cat([invalid_mask_main, invalid_mask_extra], dim=1)
-        else:
-            gathered_kv = gathered_kv_main
-            invalid_mask_combined = invalid_mask_main
-
         output, lse = _run_chunked_attention_triton(
-            q_reshaped, gathered_kv, invalid_mask_combined,
+            q_reshaped, gathered_kv, invalid_mask,
             d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
             attn_sink=attn_sink, chunk_size=8192
         )
