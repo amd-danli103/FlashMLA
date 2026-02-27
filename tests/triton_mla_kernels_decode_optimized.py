@@ -21,6 +21,19 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
+
+def _compute_safe_chunk_size(total_tokens: int, topk: int, d_qk: int) -> int:
+    """Compute the maximum number of tokens that can be processed without int32 overflow."""
+    stride_out_t = topk * d_qk
+    max_int32 = 2**31 - 1
+    # We want (chunk_tokens - 1) * stride_out_t < max_int32
+    # So chunk_tokens < max_int32 / stride_out_t + 1
+    if stride_out_t == 0:
+        return total_tokens
+    max_chunk = max_int32 // stride_out_t
+    # Use a slightly smaller chunk to be safe
+    return max(1, min(total_tokens, max_chunk))
+
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # Constants for MODEL1 layout
@@ -348,9 +361,6 @@ def gather_dequant_fp8_model1_fused_mask(
     total_tokens, topk = indices.shape
     d_qk = MODEL1_D_QK
 
-    max_offset = (total_tokens - 1) * output_kv.stride(0) + (topk + k_offset - 1) * output_kv.stride(1)
-    if max_offset > 2**31 - 1:
-        return False
 
     num_blocks = kv_cache_quantized.shape[0]
 
@@ -406,9 +416,6 @@ def gather_dequant_fp8_v32_fused_mask(
     total_tokens, topk = indices.shape
     d_qk = V32_D_QK
 
-    max_offset = (total_tokens - 1) * output_kv.stride(0) + (topk + k_offset - 1) * output_kv.stride(1)
-    if max_offset > 2**31 - 1:
-        return False
 
     num_blocks = kv_cache_quantized.shape[0]
 
@@ -713,9 +720,6 @@ def gather_dequant_fp8_model1_write_mask(
     d_qk = MODEL1_D_QK
 
     # Check for int32 overflow - if so, return False to signal fallback needed
-    max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
-    if max_offset > 2**31 - 1:
-        return False
 
     num_blocks = kv_cache_quantized.shape[0]
 
@@ -765,9 +769,6 @@ def gather_dequant_fp8_v32_write_mask(
     d_qk = V32_D_QK
 
     # Check for int32 overflow - if so, return False to signal fallback needed
-    max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
-    if max_offset > 2**31 - 1:
-        return False
 
     num_blocks = kv_cache_quantized.shape[0]
 
@@ -1289,9 +1290,6 @@ def gather_dequant_fp8_model1(
     total_tokens, topk = indices.shape
     d_qk = MODEL1_D_QK
 
-    max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
-    if max_offset > 2**31 - 1:
-        return gather_dequant_fp8_model1_fast(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
     return gather_dequant_fp8_model1_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
@@ -1308,9 +1306,6 @@ def gather_dequant_fp8_v32(
     total_tokens, topk = indices.shape
     d_qk = V32_D_QK
 
-    max_offset = (total_tokens - 1) * topk * d_qk + (topk - 1) * d_qk
-    if max_offset > 2**31 - 1:
-        return gather_dequant_fp8_v32_pytorch(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
     return gather_dequant_fp8_v32_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
@@ -1579,9 +1574,84 @@ def triton_sparse_attn_decode(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Optimized sparse attention decode with unified buffer for main+extra KV.
 
-    Version 8.0: Reduced Python overhead by fusing topk_length mask computation into Triton kernels.
-    Uses fused kernel only when topk_length is present to avoid overhead for common case.
+    Version 9.0: Handles large workloads by processing in chunks to avoid int32 overflow.
     """
+    assert kv_scope is not None
+    b, s_q, h_q, d_qk = q.shape
+    total_tokens = b * s_q
+
+    topk_main = kv_scope.indices_in_kvcache.size(-1)
+    topk_extra = extra_kv_scope.indices_in_kvcache.size(-1) if extra_kv_scope is not None else 0
+    total_topk = topk_main + topk_extra
+
+    # Check if we need to use chunked processing to avoid int32 overflow
+    stride_out_t = total_topk * d_qk
+    max_int32 = 2**31 - 1
+    max_safe_tokens = max_int32 // stride_out_t if stride_out_t > 0 else total_tokens
+
+    if total_tokens > max_safe_tokens:
+        # Process in chunks to avoid overflow
+        chunk_size = max(1, max_safe_tokens)
+        num_chunks = (total_tokens + chunk_size - 1) // chunk_size
+
+        # Reshape q for chunked processing
+        q_flat = q.reshape(total_tokens, h_q, d_qk)
+
+        # Process each chunk
+        outputs = []
+        lses = []
+
+        for chunk_idx in range(num_chunks):
+            start_t = chunk_idx * chunk_size
+            end_t = min(start_t + chunk_size, total_tokens)
+            chunk_tokens = end_t - start_t
+
+            # Extract chunk of q
+            q_chunk = q_flat[start_t:end_t].reshape(chunk_tokens, h_q, d_qk)
+
+            # Create chunk-specific kv_scope
+            class ChunkKVScope:
+                def __init__(self, orig_scope, start_t, end_t, s_q):
+                    self.blocked_k = orig_scope.blocked_k
+                    self.blocked_k_quantized = orig_scope.blocked_k_quantized
+                    # Reshape indices for this chunk
+                    orig_indices = orig_scope.indices_in_kvcache.reshape(-1, orig_scope.indices_in_kvcache.size(-1))
+                    self.indices_in_kvcache = orig_indices[start_t:end_t]
+                    self.topk_length = None
+                    if orig_scope.topk_length is not None:
+                        # Compute batch indices for this chunk
+                        batch_start = start_t // s_q
+                        batch_end = (end_t + s_q - 1) // s_q
+                        self.topk_length = orig_scope.topk_length[batch_start:batch_end]
+
+            chunk_kv_scope = ChunkKVScope(kv_scope, start_t, end_t, s_q)
+            chunk_extra_kv_scope = None
+            if extra_kv_scope is not None:
+                chunk_extra_kv_scope = ChunkKVScope(extra_kv_scope, start_t, end_t, s_q)
+
+            # Process this chunk
+            chunk_out, chunk_lse = _triton_sparse_attn_decode_impl(
+                q_chunk.unsqueeze(0).reshape(chunk_tokens, 1, h_q, d_qk),
+                chunk_kv_scope, chunk_extra_kv_scope, sm_scale, d_v, attn_sink
+            )
+
+            outputs.append(chunk_out.reshape(chunk_tokens, h_q, d_v))
+            lses.append(chunk_lse.reshape(chunk_tokens, h_q))
+
+        # Concatenate results
+        output = torch.cat(outputs, dim=0).reshape(b, s_q, h_q, d_v)
+        lse = torch.cat(lses, dim=0).reshape(b, s_q, h_q).transpose(1, 2)
+
+        return output, lse
+    else:
+        return _triton_sparse_attn_decode_impl(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
+
+
+def _triton_sparse_attn_decode_impl(
+    q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
+    d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Internal implementation of sparse attention decode."""
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
     total_tokens = b * s_q
@@ -1598,7 +1668,6 @@ def triton_sparse_attn_decode(
     indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
 
     if kv_scope.blocked_k_quantized is not None:
-        # Use fused kernel with topk_length only when topk_length is present
         if kv_scope.topk_length is not None:
             used_triton = False
             if d_qk == 576:
@@ -1613,7 +1682,6 @@ def triton_sparse_attn_decode(
                 raise ValueError(f"Unsupported d_qk: {d_qk}")
 
             if not used_triton:
-                # Fallback path
                 scope_invalid_mask = indices_main == -1
                 topk_length_mask = (
                     torch.arange(0, topk_main, device=q.device).view(1, 1, topk_main).broadcast_to(b, s_q, topk_main)
@@ -1626,7 +1694,6 @@ def triton_sparse_attn_decode(
                 elif d_qk == 512:
                     gather_dequant_fp8_model1(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
         else:
-            # Use original kernel without topk_length (faster for common case)
             used_triton = False
             if d_qk == 576:
                 used_triton = gather_dequant_fp8_v32_write_mask(kv_scope.blocked_k_quantized, indices_main, block_size_main, gathered_kv, invalid_mask, 0)
@@ -1732,3 +1799,4 @@ def triton_sparse_attn_decode(
         )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
+
