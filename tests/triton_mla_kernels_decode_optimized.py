@@ -829,9 +829,11 @@ def _unified_sparse_decode_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Unified attention kernel with single KV buffer."""
+    """Unified attention kernel with single KV buffer (int64 safe)."""
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
+    # Convert to int64 to avoid overflow with large strides
+    pid_t_64 = pid_t.to(tl.int64)
 
     NEG_INF = float("-inf")
     POS_INF = float("+inf")
@@ -847,9 +849,10 @@ def _unified_sparse_decode_kernel(
     acc_2 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     acc_3 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
 
-    q_base = Q + pid_t * stride_q_t
-    kv_base = KV + pid_t * stride_kv_t
-    mask_base = Mask + pid_t * stride_mask_t
+    # Use int64 for base pointer calculations to avoid overflow
+    q_base = Q + pid_t_64 * stride_q_t
+    kv_base = KV + pid_t_64 * stride_kv_t
+    mask_base = Mask + pid_t_64 * stride_mask_t
 
     for n_start in range(0, total_topk, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -924,9 +927,9 @@ def _unified_sparse_decode_kernel(
     acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
     lse = tl.where(is_lonely_q, POS_INF, lse)
 
-    tl.store(LSE + pid_t * stride_lse_t + offs_h * stride_lse_h, lse, mask=mask_h)
+    tl.store(LSE + pid_t_64 * stride_lse_t + offs_h * stride_lse_h, lse, mask=mask_h)
 
-    o_base = Output + pid_t * stride_o_t
+    o_base = Output + pid_t_64 * stride_o_t
     offs_v = tl.arange(0, BLOCK_D)
     tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
     offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
@@ -1214,7 +1217,7 @@ def _triton_sparse_attn_decode_impl(
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
 
-    if total_topk <= 8192:
+    if total_topk <= 65536:  # Increased limit with int64-safe kernel
         output, lse = _run_unified_attention(
             q_reshaped, gathered_kv, invalid_mask,
             d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
@@ -1224,7 +1227,7 @@ def _triton_sparse_attn_decode_impl(
         output, lse = _run_chunked_attention_triton(
             q_reshaped, gathered_kv, invalid_mask,
             d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-            attn_sink=attn_sink, chunk_size=8192
+            attn_sink=attn_sink, chunk_size=32768
         )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
