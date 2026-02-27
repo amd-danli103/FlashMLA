@@ -21,19 +21,6 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
-
-def _compute_safe_chunk_size(total_tokens: int, topk: int, d_qk: int) -> int:
-    """Compute the maximum number of tokens that can be processed without int32 overflow."""
-    stride_out_t = topk * d_qk
-    max_int32 = 2**31 - 1
-    # We want (chunk_tokens - 1) * stride_out_t < max_int32
-    # So chunk_tokens < max_int32 / stride_out_t + 1
-    if stride_out_t == 0:
-        return total_tokens
-    max_chunk = max_int32 // stride_out_t
-    # Use a slightly smaller chunk to be safe
-    return max(1, min(total_tokens, max_chunk))
-
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # Constants for MODEL1 layout
@@ -800,6 +787,7 @@ def gather_dequant_fp8_v32_write_mask(
         TILE_SIZE=V32_TILE_SIZE,
         NUM_TILES=V32_NUM_TILES,
     )
+    return True
 
 
 # ============================================================================
@@ -1545,52 +1533,29 @@ def _triton_sparse_attn_decode_impl(
     gathered_kv = torch.empty(total_tokens, total_topk, d_qk, dtype=torch.bfloat16, device=q.device)
     invalid_mask = torch.empty(total_tokens, total_topk, dtype=torch.bool, device=q.device)
 
+    # Dispatch functions based on d_qk
+    if d_qk == 576:
+        fused_mask_fn = gather_dequant_fp8_v32_fused_mask
+        write_mask_fn = gather_dequant_fp8_v32_write_mask
+    elif d_qk == 512:
+        fused_mask_fn = gather_dequant_fp8_model1_fused_mask
+        write_mask_fn = gather_dequant_fp8_model1_write_mask
+    else:
+        raise ValueError(f"Unsupported d_qk: {d_qk}")
+
     # Process main scope
     block_size_main = kv_scope.blocked_k.shape[1]
     indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
 
     if kv_scope.blocked_k_quantized is not None:
         if kv_scope.topk_length is not None:
-            used_triton = False
-            if d_qk == 576:
-                used_triton = gather_dequant_fp8_v32_fused_mask(
-                    kv_scope.blocked_k_quantized, indices_main, kv_scope.topk_length,
-                    block_size_main, gathered_kv, invalid_mask, 0, s_q)
-            elif d_qk == 512:
-                used_triton = gather_dequant_fp8_model1_fused_mask(
-                    kv_scope.blocked_k_quantized, indices_main, kv_scope.topk_length,
-                    block_size_main, gathered_kv, invalid_mask, 0, s_q)
-            else:
-                raise ValueError(f"Unsupported d_qk: {d_qk}")
-
-            if not used_triton:
-                scope_invalid_mask = indices_main == -1
-                topk_length_mask = (
-                    torch.arange(0, topk_main, device=q.device).view(1, 1, topk_main).broadcast_to(b, s_q, topk_main)
-                    >= kv_scope.topk_length.view(b, 1, 1)
-                ).reshape(total_tokens, topk_main)
-                scope_invalid_mask = scope_invalid_mask | topk_length_mask
-                invalid_mask[:, :topk_main] = scope_invalid_mask
-                if d_qk == 576:
-                    gather_dequant_fp8_v32(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
-                elif d_qk == 512:
-                    gather_dequant_fp8_model1(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
+            fused_mask_fn(
+                kv_scope.blocked_k_quantized, indices_main, kv_scope.topk_length,
+                block_size_main, gathered_kv, invalid_mask, 0, s_q)
         else:
-            used_triton = False
-            if d_qk == 576:
-                used_triton = gather_dequant_fp8_v32_write_mask(kv_scope.blocked_k_quantized, indices_main, block_size_main, gathered_kv, invalid_mask, 0)
-            elif d_qk == 512:
-                used_triton = gather_dequant_fp8_model1_write_mask(kv_scope.blocked_k_quantized, indices_main, block_size_main, gathered_kv, invalid_mask, 0)
-            else:
-                raise ValueError(f"Unsupported d_qk: {d_qk}")
-
-            if not used_triton:
-                scope_invalid_mask = indices_main == -1
-                invalid_mask[:, :topk_main] = scope_invalid_mask
-                if d_qk == 576:
-                    gather_dequant_fp8_v32(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
-                elif d_qk == 512:
-                    gather_dequant_fp8_model1(kv_scope.blocked_k_quantized, indices_main, scope_invalid_mask, block_size_main, gathered_kv, 0)
+            write_mask_fn(
+                kv_scope.blocked_k_quantized, indices_main,
+                block_size_main, gathered_kv, invalid_mask, 0)
     else:
         scope_invalid_mask = indices_main == -1
         if kv_scope.topk_length is not None:
@@ -1612,42 +1577,13 @@ def _triton_sparse_attn_decode_impl(
 
         if extra_kv_scope.blocked_k_quantized is not None:
             if extra_kv_scope.topk_length is not None:
-                used_triton = False
-                if d_qk == 576:
-                    used_triton = gather_dequant_fp8_v32_fused_mask(
-                        extra_kv_scope.blocked_k_quantized, indices_extra, extra_kv_scope.topk_length,
-                        block_size_extra, gathered_kv, invalid_mask, topk_main, s_q)
-                elif d_qk == 512:
-                    used_triton = gather_dequant_fp8_model1_fused_mask(
-                        extra_kv_scope.blocked_k_quantized, indices_extra, extra_kv_scope.topk_length,
-                        block_size_extra, gathered_kv, invalid_mask, topk_main, s_q)
-
-                if not used_triton:
-                    scope_invalid_mask = indices_extra == -1
-                    topk_length_mask = (
-                        torch.arange(0, topk_extra, device=q.device).view(1, 1, topk_extra).broadcast_to(b, s_q, topk_extra)
-                        >= extra_kv_scope.topk_length.view(b, 1, 1)
-                    ).reshape(total_tokens, topk_extra)
-                    scope_invalid_mask = scope_invalid_mask | topk_length_mask
-                    invalid_mask[:, topk_main:] = scope_invalid_mask
-                    if d_qk == 576:
-                        gather_dequant_fp8_v32(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
-                    elif d_qk == 512:
-                        gather_dequant_fp8_model1(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+                fused_mask_fn(
+                    extra_kv_scope.blocked_k_quantized, indices_extra, extra_kv_scope.topk_length,
+                    block_size_extra, gathered_kv, invalid_mask, topk_main, s_q)
             else:
-                used_triton = False
-                if d_qk == 576:
-                    used_triton = gather_dequant_fp8_v32_write_mask(extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, gathered_kv, invalid_mask, topk_main)
-                elif d_qk == 512:
-                    used_triton = gather_dequant_fp8_model1_write_mask(extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, gathered_kv, invalid_mask, topk_main)
-
-                if not used_triton:
-                    scope_invalid_mask = indices_extra == -1
-                    invalid_mask[:, topk_main:] = scope_invalid_mask
-                    if d_qk == 576:
-                        gather_dequant_fp8_v32(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
-                    elif d_qk == 512:
-                        gather_dequant_fp8_model1(extra_kv_scope.blocked_k_quantized, indices_extra, scope_invalid_mask, block_size_extra, gathered_kv, topk_main)
+                write_mask_fn(
+                    extra_kv_scope.blocked_k_quantized, indices_extra,
+                    block_size_extra, gathered_kv, invalid_mask, topk_main)
         else:
             scope_invalid_mask = indices_extra == -1
             if extra_kv_scope.topk_length is not None:
@@ -1681,4 +1617,3 @@ def _triton_sparse_attn_decode_impl(
         )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
-
