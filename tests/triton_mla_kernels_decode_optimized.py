@@ -1157,122 +1157,6 @@ def gather_dequant_fp8_v32_triton(
 
     return output
 
-# ============================================================================
-# PyTorch Fallback Implementations
-# ============================================================================
-
-def gather_dequant_fp8_model1_fast(
-    kv_cache_quantized: torch.Tensor,
-    indices: torch.Tensor,
-    invalid_mask: torch.Tensor,
-    block_size: int,
-    output: torch.Tensor = None,
-    k_offset: int = 0,
-) -> torch.Tensor:
-    """Optimized PyTorch MODEL1 gather+dequant with offset support."""
-    d_qk = 512
-    d_nope = 448
-    d_rope = 64
-    tile_size = 64
-    num_tiles = 7
-    bytes_per_token_data = 576
-    bytes_per_token_scale = 8
-
-    total_tokens, topk = indices.shape
-    device = kv_cache_quantized.device
-    num_blocks = kv_cache_quantized.shape[0]
-
-    indices_clamped = indices.clamp(min=0)
-    block_idx = indices_clamped // block_size
-    offset_in_block = indices_clamped % block_size
-
-    kv_uint8 = kv_cache_quantized.view(torch.uint8)
-    bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
-    kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
-
-    nope_rope_size = block_size * bytes_per_token_data
-    nope_rope_view = kv_flat[:, :nope_rope_size].view(num_blocks, block_size, bytes_per_token_data)
-    scales_view = kv_flat[:, nope_rope_size:nope_rope_size + block_size * bytes_per_token_scale].view(
-        num_blocks, block_size, bytes_per_token_scale)
-
-    flat_block_idx = block_idx.view(-1)
-    flat_offset = offset_in_block.view(-1)
-
-    gathered_nope_rope = nope_rope_view[flat_block_idx, flat_offset].view(total_tokens, topk, bytes_per_token_data)
-    gathered_scales = scales_view[flat_block_idx, flat_offset].view(total_tokens, topk, bytes_per_token_scale)
-
-    gathered_nope = gathered_nope_rope[..., :d_nope].view(torch.float8_e4m3fn)
-    gathered_rope = gathered_nope_rope[..., d_nope:].contiguous().view(torch.bfloat16)
-    gathered_scales = gathered_scales[..., :num_tiles].view(torch.float8_e8m0fnu)
-
-    nope_bf16 = gathered_nope.to(torch.bfloat16)
-    scales_bf16 = gathered_scales.to(torch.bfloat16)
-
-    scales_expanded = scales_bf16.view(total_tokens, topk, num_tiles, 1).expand(
-        total_tokens, topk, num_tiles, tile_size).reshape(total_tokens, topk, d_nope)
-
-    if output is None:
-        output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
-        output[..., :d_nope] = nope_bf16 * scales_expanded
-        output[..., d_nope:] = gathered_rope
-        output[invalid_mask] = 0
-    else:
-        output[:, k_offset:k_offset+topk, :d_nope] = nope_bf16 * scales_expanded
-        output[:, k_offset:k_offset+topk, d_nope:] = gathered_rope
-        output[:, k_offset:k_offset+topk][invalid_mask] = 0
-
-    return output
-
-
-def gather_dequant_fp8_v32_pytorch(
-    kv_cache_quantized: torch.Tensor,
-    indices: torch.Tensor,
-    invalid_mask: torch.Tensor,
-    block_size: int,
-    output: torch.Tensor = None,
-    k_offset: int = 0,
-) -> torch.Tensor:
-    """PyTorch V32 layout gather+dequant with offset support."""
-    d_qk = 576
-    d_nope = 512
-    d_rope = 64
-    tile_size = 128
-    num_tiles = 4
-    bytes_per_token = 656
-
-    total_tokens, topk = indices.shape
-    device = kv_cache_quantized.device
-    num_blocks = kv_cache_quantized.shape[0]
-
-    indices_clamped = torch.clamp(indices, min=0)
-    block_idx = indices_clamped // block_size
-    offset_in_block = indices_clamped % block_size
-
-    kv_per_block = kv_cache_quantized.view(num_blocks, block_size, bytes_per_token)
-    flat_block_idx = block_idx.view(-1)
-    flat_offset = offset_in_block.view(-1)
-
-    gathered_bytes = kv_per_block[flat_block_idx, flat_offset]
-    gathered_bytes = gathered_bytes.view(total_tokens, topk, bytes_per_token)
-
-    nope_fp8 = gathered_bytes[..., :d_nope].view(torch.float8_e4m3fn)
-    scales = gathered_bytes[..., d_nope:d_nope + num_tiles * 4].contiguous().view(torch.float32)
-    rope_bf16 = gathered_bytes[..., d_nope + num_tiles * 4:].contiguous().view(torch.bfloat16)
-
-    nope_f32 = nope_fp8.to(torch.float32)
-    scales_expanded = scales.repeat_interleave(tile_size, dim=-1)
-
-    if output is None:
-        output = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=device)
-        output[..., :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
-        output[..., d_nope:] = rope_bf16
-        output[invalid_mask] = 0
-    else:
-        output[:, k_offset:k_offset+topk, :d_nope] = (nope_f32 * scales_expanded).to(torch.bfloat16)
-        output[:, k_offset:k_offset+topk, d_nope:] = rope_bf16
-        output[:, k_offset:k_offset+topk][invalid_mask] = 0
-
-    return output
 
 # ============================================================================
 # Main Entry Points
@@ -1290,7 +1174,6 @@ def gather_dequant_fp8_model1(
     total_tokens, topk = indices.shape
     d_qk = MODEL1_D_QK
 
-
     return gather_dequant_fp8_model1_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
 
@@ -1305,7 +1188,6 @@ def gather_dequant_fp8_v32(
     """V32 layout gather+dequant with offset support."""
     total_tokens, topk = indices.shape
     d_qk = V32_D_QK
-
 
     return gather_dequant_fp8_v32_triton(kv_cache_quantized, indices, invalid_mask, block_size, output, k_offset)
 
