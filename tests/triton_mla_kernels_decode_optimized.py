@@ -1202,13 +1202,113 @@ def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
 
 
 
+# ============================================================================
+# Helper class and functions for token-range based chunking
+# ============================================================================
+
+class _SlicedKVScope:
+    """A sliced view of KV scope for a specific token range."""
+    __slots__ = ['blocked_k', 'blocked_k_quantized', 'indices_in_kvcache', 'topk_length']
+
+    def __init__(self, blocked_k, blocked_k_quantized, indices_in_kvcache, topk_length):
+        self.blocked_k = blocked_k
+        self.blocked_k_quantized = blocked_k_quantized
+        self.indices_in_kvcache = indices_in_kvcache
+        self.topk_length = topk_length
+
+
+def _slice_kv_scope_for_tokens(orig_scope, start_t: int, end_t: int, s_q: int):
+    """Slice a KV scope to only include tokens in range [start_t, end_t).
+
+    Args:
+        orig_scope: Original KV scope with blocked_k, blocked_k_quantized,
+                    indices_in_kvcache, and topk_length attributes.
+        start_t: Start token index (inclusive).
+        end_t: End token index (exclusive).
+        s_q: Sequence length per batch (used for topk_length slicing).
+
+    Returns:
+        A _SlicedKVScope containing only the data for the specified token range.
+
+    Note:
+        When s_q > 1, topk_length is per-batch but we're processing per-token.
+        We expand topk_length to per-token by repeating each batch's value s_q times.
+    """
+    if orig_scope is None:
+        return None
+
+    # Slice indices
+    orig_indices = orig_scope.indices_in_kvcache.reshape(-1, orig_scope.indices_in_kvcache.size(-1))
+    sliced_indices = orig_indices[start_t:end_t]
+
+    # Slice and expand topk_length if present
+    sliced_topk_length = None
+    if orig_scope.topk_length is not None:
+        batch_start = start_t // s_q
+        batch_end = (end_t + s_q - 1) // s_q
+        batch_topk_length = orig_scope.topk_length[batch_start:batch_end]
+        if s_q > 1:
+            # Expand batch-level topk_length to token-level
+            chunk_tokens = end_t - start_t
+            expanded = batch_topk_length.unsqueeze(1).expand(-1, s_q).reshape(-1)
+            offset_in_first_batch = start_t % s_q
+            sliced_topk_length = expanded[offset_in_first_batch:offset_in_first_batch + chunk_tokens]
+        else:
+            sliced_topk_length = batch_topk_length
+
+    return _SlicedKVScope(
+        blocked_k=orig_scope.blocked_k,
+        blocked_k_quantized=orig_scope.blocked_k_quantized,
+        indices_in_kvcache=sliced_indices,
+        topk_length=sliced_topk_length
+    )
+
+
+def _compute_token_ranges(total_tokens: int, total_topk: int, d_qk: int,
+                          max_buffer_bytes: int = 4 * 1024 * 1024 * 1024) -> list:
+    """Compute token ranges for processing, chunking if buffer would exceed limit.
+
+    Args:
+        total_tokens: Total number of tokens to process.
+        total_topk: Total topk (main + extra).
+        d_qk: Dimension of QK.
+        max_buffer_bytes: Maximum buffer size in bytes (default 4GB).
+
+    Returns:
+        List of (start_t, end_t) tuples representing token ranges to process.
+        Returns [(0, total_tokens)] if no chunking needed (single range),
+        otherwise returns multiple ranges. Caller uses the same loop for both cases.
+    """
+    buffer_size_bytes = total_tokens * total_topk * d_qk * 2  # bfloat16 = 2 bytes
+
+    if buffer_size_bytes <= max_buffer_bytes:
+        return [(0, total_tokens)]
+
+    # Calculate chunk size to keep buffer under limit
+    max_tokens_per_chunk = max_buffer_bytes // (total_topk * d_qk * 2)
+    chunk_size = max(1, max_tokens_per_chunk)
+
+    # Build list of token ranges
+    token_ranges = []
+    start_t = 0
+    while start_t < total_tokens:
+        end_t = min(start_t + chunk_size, total_tokens)
+        token_ranges.append((start_t, end_t))
+        start_t = end_t
+
+    return token_ranges
+
+
 def triton_sparse_attn_decode(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
     d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Optimized sparse attention decode with unified buffer for main+extra KV.
 
-    Version 10.0: Uses int64 arithmetic. Chunks only when buffer would exceed GPU memory.
+    Version 11.0: Unified token-range loop for all cases.
+    Always computes token_ranges first (single range [(0, total_tokens)] if no
+    chunking needed, multiple ranges otherwise), then processes with a single loop.
+    Chunks by tokens when buffer would exceed 4GB.
     """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
@@ -1218,67 +1318,41 @@ def triton_sparse_attn_decode(
     topk_extra = extra_kv_scope.indices_in_kvcache.size(-1) if extra_kv_scope is not None else 0
     total_topk = topk_main + topk_extra
 
-    # Check if buffer would be too large (> 4GB to leave room for other allocations)
-    buffer_size_bytes = total_tokens * total_topk * d_qk * 2  # bfloat16 = 2 bytes
-    max_buffer_bytes = 4 * 1024 * 1024 * 1024  # 4GB
+    # Compute token ranges (single range if no chunking, multiple if chunking needed)
+    token_ranges = _compute_token_ranges(total_tokens, total_topk, d_qk)
 
-    if buffer_size_bytes > max_buffer_bytes:
-        # Process in chunks to reduce memory usage
-        # Calculate chunk size to keep buffer under limit
-        max_tokens_per_chunk = max_buffer_bytes // (total_topk * d_qk * 2)
-        chunk_size = max(1, max_tokens_per_chunk)
-        num_chunks = (total_tokens + chunk_size - 1) // chunk_size
+    # Fast path: single range covering all tokens
+    if len(token_ranges) == 1:
+        return _triton_sparse_attn_decode_impl(
+            q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink
+        )
 
-        # Reshape q for chunked processing
-        q_flat = q.reshape(total_tokens, h_q, d_qk)
+    # Chunked path: process each token range
+    outputs = []
+    lses = []
 
-        # Process each chunk
-        outputs = []
-        lses = []
+    for start_t, end_t in token_ranges:
+        chunk_tokens = end_t - start_t
 
-        for chunk_idx in range(num_chunks):
-            start_t = chunk_idx * chunk_size
-            end_t = min(start_t + chunk_size, total_tokens)
-            chunk_tokens = end_t - start_t
+        # Slice q and scopes for this chunk
+        q_chunk = q.reshape(total_tokens, h_q, d_qk)[start_t:end_t]
+        q_input = q_chunk.reshape(chunk_tokens, 1, h_q, d_qk)
+        chunk_kv_scope = _slice_kv_scope_for_tokens(kv_scope, start_t, end_t, s_q)
+        chunk_extra_kv_scope = _slice_kv_scope_for_tokens(extra_kv_scope, start_t, end_t, s_q)
 
-            # Extract chunk of q
-            q_chunk = q_flat[start_t:end_t].reshape(chunk_tokens, h_q, d_qk)
+        # Process this chunk
+        chunk_out, chunk_lse = _triton_sparse_attn_decode_impl(
+            q_input, chunk_kv_scope, chunk_extra_kv_scope, sm_scale, d_v, attn_sink
+        )
 
-            # Create chunk-specific kv_scope
-            class ChunkKVScope:
-                def __init__(self, orig_scope, start_t, end_t, s_q):
-                    self.blocked_k = orig_scope.blocked_k
-                    self.blocked_k_quantized = orig_scope.blocked_k_quantized
-                    orig_indices = orig_scope.indices_in_kvcache.reshape(-1, orig_scope.indices_in_kvcache.size(-1))
-                    self.indices_in_kvcache = orig_indices[start_t:end_t]
-                    self.topk_length = None
-                    if orig_scope.topk_length is not None:
-                        batch_start = start_t // s_q
-                        batch_end = (end_t + s_q - 1) // s_q
-                        self.topk_length = orig_scope.topk_length[batch_start:batch_end]
+        outputs.append(chunk_out.reshape(chunk_tokens, h_q, d_v))
+        lses.append(chunk_lse.reshape(chunk_tokens, h_q))
 
-            chunk_kv_scope = ChunkKVScope(kv_scope, start_t, end_t, s_q)
-            chunk_extra_kv_scope = None
-            if extra_kv_scope is not None:
-                chunk_extra_kv_scope = ChunkKVScope(extra_kv_scope, start_t, end_t, s_q)
+    # Concatenate and reshape results
+    output = torch.cat(outputs, dim=0).reshape(b, s_q, h_q, d_v)
+    lse = torch.cat(lses, dim=0).reshape(b, s_q, h_q).transpose(1, 2)
 
-            # Process this chunk
-            chunk_out, chunk_lse = _triton_sparse_attn_decode_impl(
-                q_chunk.unsqueeze(0).reshape(chunk_tokens, 1, h_q, d_qk),
-                chunk_kv_scope, chunk_extra_kv_scope, sm_scale, d_v, attn_sink
-            )
-
-            outputs.append(chunk_out.reshape(chunk_tokens, h_q, d_v))
-            lses.append(chunk_lse.reshape(chunk_tokens, h_q))
-
-        # Concatenate results
-        output = torch.cat(outputs, dim=0).reshape(b, s_q, h_q, d_v)
-        lse = torch.cat(lses, dim=0).reshape(b, s_q, h_q).transpose(1, 2)
-
-        return output, lse
-    else:
-        return _triton_sparse_attn_decode_impl(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
-
+    return output, lse
 
 def _triton_sparse_attn_decode_impl(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
