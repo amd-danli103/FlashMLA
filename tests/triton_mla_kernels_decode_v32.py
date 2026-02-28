@@ -3,8 +3,16 @@ Triton MLA Decode Kernels for V3.2 (d_qk=576).
 
 This module contains V3.2-specific gather+dequant kernels and the main
 sparse attention decode entry point for V3.2.
+
+Optimized version with:
+- Triton cache persistence
+- Batched scale loading (preload all 4 scales)
+- Unrolled tile processing
+- Fixed kernel for small workloads
+- Extended autotune configurations
 """
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -18,6 +26,10 @@ from triton_mla_kernels_decode_common import (
     compute_token_ranges,
 )
 
+# Enable Triton autotune cache persistence
+TRITON_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".triton_cache")
+os.makedirs(TRITON_CACHE_DIR, exist_ok=True)
+os.environ.setdefault("TRITON_CACHE_DIR", TRITON_CACHE_DIR)
 
 # Constants for V32 layout
 V32_D_QK = 576
@@ -29,7 +41,7 @@ V32_BYTES_PER_TOKEN = 656
 
 
 # ============================================================================
-# V32 Gather+Dequant Kernel
+# V32 Gather+Dequant Kernels - Optimized with Batched Scale Loading
 # ============================================================================
 
 @triton.autotune(
@@ -39,10 +51,17 @@ V32_BYTES_PER_TOKEN = 656
         triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 64}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_TK': 128}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_TK': 256}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_TK': 256}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_TK': 512}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_TK': 512}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_TK': 512}, num_warps=8, num_stages=2),
     ],
     key=['total_tokens', 'topk', 'workload_size_cat'],
 )
@@ -69,10 +88,9 @@ def _gather_dequant_v32_kernel(
     D_NOPE: tl.constexpr,
     D_ROPE: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    NUM_TILES: tl.constexpr,
     HAS_TOPK_LENGTH: tl.constexpr,
 ):
-    """Unified gather + dequant + mask kernel for V32 layout."""
+    """Optimized gather + dequant kernel with batched scale loading for V32 layout."""
     pid = tl.program_id(0)
     num_tk = total_tokens * topk
 
@@ -112,45 +130,362 @@ def _gather_dequant_v32_kernel(
     stride_out_k_64 = tl.cast(stride_out_k, tl.int64)
     out_base_ptrs = OutputKV + t_idx_64 * stride_out_t_64 + (k_idx_64 + k_offset) * stride_out_k_64
 
-    for tile_idx in range(NUM_TILES):
-        tile_start = tile_idx * TILE_SIZE
+    # Preload all 4 scales at once (each scale is 4 bytes float32)
+    scale_base = D_NOPE
 
-        scale_byte_offset = D_NOPE + tile_idx * 4
-        scale_b0_ptrs = kv_base_ptrs + scale_byte_offset
-        scale_b1_ptrs = kv_base_ptrs + scale_byte_offset + 1
-        scale_b2_ptrs = kv_base_ptrs + scale_byte_offset + 2
-        scale_b3_ptrs = kv_base_ptrs + scale_byte_offset + 3
+    # Load scale 0 (4 bytes)
+    scale_b0_0 = tl.load(kv_base_ptrs + scale_base, mask=valid_mask, other=0)
+    scale_b1_0 = tl.load(kv_base_ptrs + scale_base + 1, mask=valid_mask, other=0)
+    scale_b2_0 = tl.load(kv_base_ptrs + scale_base + 2, mask=valid_mask, other=0)
+    scale_b3_0 = tl.load(kv_base_ptrs + scale_base + 3, mask=valid_mask, other=0)
+    scale_uint32_0 = (scale_b0_0.to(tl.uint32) | (scale_b1_0.to(tl.uint32) << 8) |
+                      (scale_b2_0.to(tl.uint32) << 16) | (scale_b3_0.to(tl.uint32) << 24))
+    scale_f32_0 = scale_uint32_0.to(tl.float32, bitcast=True)
 
-        scale_b0 = tl.load(scale_b0_ptrs, mask=valid_mask, other=0)
-        scale_b1 = tl.load(scale_b1_ptrs, mask=valid_mask, other=0)
-        scale_b2 = tl.load(scale_b2_ptrs, mask=valid_mask, other=0)
-        scale_b3 = tl.load(scale_b3_ptrs, mask=valid_mask, other=0)
+    # Load scale 1
+    scale_b0_1 = tl.load(kv_base_ptrs + scale_base + 4, mask=valid_mask, other=0)
+    scale_b1_1 = tl.load(kv_base_ptrs + scale_base + 5, mask=valid_mask, other=0)
+    scale_b2_1 = tl.load(kv_base_ptrs + scale_base + 6, mask=valid_mask, other=0)
+    scale_b3_1 = tl.load(kv_base_ptrs + scale_base + 7, mask=valid_mask, other=0)
+    scale_uint32_1 = (scale_b0_1.to(tl.uint32) | (scale_b1_1.to(tl.uint32) << 8) |
+                      (scale_b2_1.to(tl.uint32) << 16) | (scale_b3_1.to(tl.uint32) << 24))
+    scale_f32_1 = scale_uint32_1.to(tl.float32, bitcast=True)
 
-        scale_uint32 = (scale_b0.to(tl.uint32) |
-                       (scale_b1.to(tl.uint32) << 8) |
-                       (scale_b2.to(tl.uint32) << 16) |
-                       (scale_b3.to(tl.uint32) << 24))
-        scale_f32 = scale_uint32.to(tl.float32, bitcast=True)
+    # Load scale 2
+    scale_b0_2 = tl.load(kv_base_ptrs + scale_base + 8, mask=valid_mask, other=0)
+    scale_b1_2 = tl.load(kv_base_ptrs + scale_base + 9, mask=valid_mask, other=0)
+    scale_b2_2 = tl.load(kv_base_ptrs + scale_base + 10, mask=valid_mask, other=0)
+    scale_b3_2 = tl.load(kv_base_ptrs + scale_base + 11, mask=valid_mask, other=0)
+    scale_uint32_2 = (scale_b0_2.to(tl.uint32) | (scale_b1_2.to(tl.uint32) << 8) |
+                      (scale_b2_2.to(tl.uint32) << 16) | (scale_b3_2.to(tl.uint32) << 24))
+    scale_f32_2 = scale_uint32_2.to(tl.float32, bitcast=True)
 
-        for chunk in range(2):
-            chunk_start = tile_start + chunk * 64
-            offs_d = tl.arange(0, 64)
+    # Load scale 3
+    scale_b0_3 = tl.load(kv_base_ptrs + scale_base + 12, mask=valid_mask, other=0)
+    scale_b1_3 = tl.load(kv_base_ptrs + scale_base + 13, mask=valid_mask, other=0)
+    scale_b2_3 = tl.load(kv_base_ptrs + scale_base + 14, mask=valid_mask, other=0)
+    scale_b3_3 = tl.load(kv_base_ptrs + scale_base + 15, mask=valid_mask, other=0)
+    scale_uint32_3 = (scale_b0_3.to(tl.uint32) | (scale_b1_3.to(tl.uint32) << 8) |
+                      (scale_b2_3.to(tl.uint32) << 16) | (scale_b3_3.to(tl.uint32) << 24))
+    scale_f32_3 = scale_uint32_3.to(tl.float32, bitcast=True)
 
-            nope_ptrs = kv_base_ptrs[:, None] + chunk_start + offs_d[None, :]
-            nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    offs_d = tl.arange(0, 64)
 
-            nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-            nope_f32 = nope_fp8.to(tl.float32)
+    # Tile 0, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_0[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
-            dequant = nope_f32 * scale_f32[:, None]
-            dequant = tl.where(dequant != dequant, 0.0, dequant)
-            dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-            dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    # Tile 0, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_0[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
-            out_ptrs = out_base_ptrs[:, None] + (chunk_start + offs_d[None, :]) * stride_out_d
-            tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    # Tile 1, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_1[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
-    rope_byte_offset = D_NOPE + NUM_TILES * 4
+    # Tile 1, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_1[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 2, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + 2*TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_2[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (2*TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 2, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 2*TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_2[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (2*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 3, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + 3*TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_3[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (3*TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 3, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 3*TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_3[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (3*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process rope (bytes after scales: D_NOPE + NUM_TILES * 4 = 512 + 16 = 528)
+    rope_byte_offset = D_NOPE + 16
+    offs_rope = tl.arange(0, D_ROPE)
+
+    rope_lo_ptrs = kv_base_ptrs[:, None] + rope_byte_offset + offs_rope[None, :] * 2
+    rope_hi_ptrs = kv_base_ptrs[:, None] + rope_byte_offset + offs_rope[None, :] * 2 + 1
+
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+
+    rope_uint16 = rope_lo | (rope_hi << 8)
+    rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
+    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+
+    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+
+
+@triton.jit
+def _gather_dequant_v32_kernel_fixed_128(
+    KV_Cache,
+    Indices,
+    TopkLength,
+    OutputKV,
+    OutputMask,
+    total_tokens,
+    topk,
+    num_blocks,
+    block_size,
+    k_offset,
+    s_q,
+    stride_kv_block,
+    stride_kv_token,
+    stride_idx_t, stride_idx_k,
+    stride_out_t, stride_out_k, stride_out_d,
+    stride_mask_t, stride_mask_k,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HAS_TOPK_LENGTH: tl.constexpr,
+):
+    """Fixed-config gather kernel with BLOCK_TK=128 for V32."""
+    BLOCK_TK: tl.constexpr = 128
+    pid = tl.program_id(0)
+    num_tk = total_tokens * topk
+
+    offs_tk = pid * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    mask_tk = offs_tk < num_tk
+
+    t_idx = offs_tk // topk
+    k_idx = offs_tk % topk
+
+    idx_ptrs = Indices + t_idx * stride_idx_t + k_idx * stride_idx_k
+    indices = tl.load(idx_ptrs, mask=mask_tk, other=-1)
+
+    is_invalid = indices == -1
+
+    if HAS_TOPK_LENGTH:
+        batch_idx = t_idx // s_q
+        topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+        is_invalid = is_invalid | (k_idx >= topk_len)
+
+    mask_out_ptrs = OutputMask + t_idx * stride_mask_t + (k_idx + k_offset) * stride_mask_k
+    tl.store(mask_out_ptrs, is_invalid, mask=mask_tk)
+
+    valid_mask = mask_tk & ~is_invalid
+    indices_clamped = tl.maximum(indices, 0)
+
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
+
+    block_idx_64 = block_idx.to(tl.int64)
+    offset_in_block_64 = offset_in_block.to(tl.int64)
+
+    kv_base_ptrs = KV_Cache + block_idx_64 * stride_kv_block + offset_in_block_64 * stride_kv_token
+
+    t_idx_64 = t_idx.to(tl.int64)
+    k_idx_64 = k_idx.to(tl.int64)
+    stride_out_t_64 = tl.cast(stride_out_t, tl.int64)
+    stride_out_k_64 = tl.cast(stride_out_k, tl.int64)
+    out_base_ptrs = OutputKV + t_idx_64 * stride_out_t_64 + (k_idx_64 + k_offset) * stride_out_k_64
+
+    # Preload all 4 scales
+    scale_base = D_NOPE
+
+    scale_b0_0 = tl.load(kv_base_ptrs + scale_base, mask=valid_mask, other=0)
+    scale_b1_0 = tl.load(kv_base_ptrs + scale_base + 1, mask=valid_mask, other=0)
+    scale_b2_0 = tl.load(kv_base_ptrs + scale_base + 2, mask=valid_mask, other=0)
+    scale_b3_0 = tl.load(kv_base_ptrs + scale_base + 3, mask=valid_mask, other=0)
+    scale_uint32_0 = (scale_b0_0.to(tl.uint32) | (scale_b1_0.to(tl.uint32) << 8) |
+                      (scale_b2_0.to(tl.uint32) << 16) | (scale_b3_0.to(tl.uint32) << 24))
+    scale_f32_0 = scale_uint32_0.to(tl.float32, bitcast=True)
+
+    scale_b0_1 = tl.load(kv_base_ptrs + scale_base + 4, mask=valid_mask, other=0)
+    scale_b1_1 = tl.load(kv_base_ptrs + scale_base + 5, mask=valid_mask, other=0)
+    scale_b2_1 = tl.load(kv_base_ptrs + scale_base + 6, mask=valid_mask, other=0)
+    scale_b3_1 = tl.load(kv_base_ptrs + scale_base + 7, mask=valid_mask, other=0)
+    scale_uint32_1 = (scale_b0_1.to(tl.uint32) | (scale_b1_1.to(tl.uint32) << 8) |
+                      (scale_b2_1.to(tl.uint32) << 16) | (scale_b3_1.to(tl.uint32) << 24))
+    scale_f32_1 = scale_uint32_1.to(tl.float32, bitcast=True)
+
+    scale_b0_2 = tl.load(kv_base_ptrs + scale_base + 8, mask=valid_mask, other=0)
+    scale_b1_2 = tl.load(kv_base_ptrs + scale_base + 9, mask=valid_mask, other=0)
+    scale_b2_2 = tl.load(kv_base_ptrs + scale_base + 10, mask=valid_mask, other=0)
+    scale_b3_2 = tl.load(kv_base_ptrs + scale_base + 11, mask=valid_mask, other=0)
+    scale_uint32_2 = (scale_b0_2.to(tl.uint32) | (scale_b1_2.to(tl.uint32) << 8) |
+                      (scale_b2_2.to(tl.uint32) << 16) | (scale_b3_2.to(tl.uint32) << 24))
+    scale_f32_2 = scale_uint32_2.to(tl.float32, bitcast=True)
+
+    scale_b0_3 = tl.load(kv_base_ptrs + scale_base + 12, mask=valid_mask, other=0)
+    scale_b1_3 = tl.load(kv_base_ptrs + scale_base + 13, mask=valid_mask, other=0)
+    scale_b2_3 = tl.load(kv_base_ptrs + scale_base + 14, mask=valid_mask, other=0)
+    scale_b3_3 = tl.load(kv_base_ptrs + scale_base + 15, mask=valid_mask, other=0)
+    scale_uint32_3 = (scale_b0_3.to(tl.uint32) | (scale_b1_3.to(tl.uint32) << 8) |
+                      (scale_b2_3.to(tl.uint32) << 16) | (scale_b3_3.to(tl.uint32) << 24))
+    scale_f32_3 = scale_uint32_3.to(tl.float32, bitcast=True)
+
+    offs_d = tl.arange(0, 64)
+
+    # Tile 0, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_0[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 0, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_0[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 1, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_1[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 1, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_1[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 2, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + 2*TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_2[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (2*TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 2, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 2*TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_2[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (2*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 3, chunk 0
+    nope_ptrs = kv_base_ptrs[:, None] + 3*TILE_SIZE + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_3[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (3*TILE_SIZE + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Tile 3, chunk 1
+    nope_ptrs = kv_base_ptrs[:, None] + 3*TILE_SIZE + 64 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_f32 = nope_fp8.to(tl.float32)
+    dequant = nope_f32 * scale_f32_3[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (3*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process rope
+    rope_byte_offset = D_NOPE + 16
     offs_rope = tl.arange(0, D_ROPE)
 
     rope_lo_ptrs = kv_base_ptrs[:, None] + rope_byte_offset + offs_rope[None, :] * 2
@@ -185,11 +520,9 @@ def gather_dequant_fp8_v32(
 ) -> bool:
     """Unified V32 gather+dequant with optional topk_length mask."""
     total_tokens, topk = indices.shape
-
     num_blocks = kv_cache_quantized.shape[0]
 
     kv_uint8 = kv_cache_quantized.view(torch.uint8)
-
     stride_kv_block = kv_uint8.stride(0)
     stride_kv_token = kv_uint8.stride(1)
     workload_size_cat = _get_workload_size_category(total_tokens, topk)
@@ -200,26 +533,16 @@ def gather_dequant_fp8_v32(
     has_topk_length = topk_length is not None
 
     _gather_dequant_v32_kernel[grid](
-        kv_uint8,
-        indices,
-        topk_length_tensor,
-        output_kv,
-        output_mask,
-        total_tokens,
-        topk,
-        num_blocks,
-        block_size,
-        workload_size_cat,
-        k_offset,
-        s_q,
+        kv_uint8, indices, topk_length_tensor,
+        output_kv, output_mask,
+        total_tokens, topk, num_blocks, block_size,
+        workload_size_cat, k_offset, s_q,
         stride_kv_block, stride_kv_token,
         indices.stride(0), indices.stride(1),
         output_kv.stride(0), output_kv.stride(1), output_kv.stride(2),
         output_mask.stride(0), output_mask.stride(1),
-        D_NOPE=V32_D_NOPE,
-        D_ROPE=V32_D_ROPE,
+        D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
         TILE_SIZE=V32_TILE_SIZE,
-        NUM_TILES=V32_NUM_TILES,
         HAS_TOPK_LENGTH=has_topk_length,
     )
     return True
@@ -230,7 +553,7 @@ def fused_gather_dequant_fp8_v32(
     kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
     output_kv, output_mask, s_q=1,
 ):
-    """Fused V32 gather - optimized wrapper for both scopes."""
+    """Fused V32 gather - optimized wrapper with fixed kernel for small workloads."""
     total_tokens, topk_main = indices_main.shape
     topk_extra = indices_extra.shape[1]
 
@@ -244,41 +567,82 @@ def fused_gather_dequant_fp8_v32(
     stride_kv_token_extra = kv_uint8_extra.stride(1)
     num_blocks_extra = kv_cache_extra.shape[0]
 
-    topk_length_main_tensor = topk_length_main if topk_length_main is not None else output_mask[:1, 0]
-    topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else output_mask[:1, 0]
+    has_topk_length_main = topk_length_main is not None
+    has_topk_length_extra = topk_length_extra is not None
+    topk_length_main_tensor = topk_length_main if has_topk_length_main else output_mask[:1, 0]
+    topk_length_extra_tensor = topk_length_extra if has_topk_length_extra else output_mask[:1, 0]
 
-    workload_main = _get_workload_size_category(total_tokens, topk_main)
-    workload_extra = _get_workload_size_category(total_tokens, topk_extra)
+    stride_idx_t_main, stride_idx_k_main = indices_main.stride(0), indices_main.stride(1)
+    stride_idx_t_extra, stride_idx_k_extra = indices_extra.stride(0), indices_extra.stride(1)
+    stride_out_t, stride_out_k, stride_out_d = output_kv.stride(0), output_kv.stride(1), output_kv.stride(2)
+    stride_mask_t, stride_mask_k = output_mask.stride(0), output_mask.stride(1)
 
-    grid_main = lambda meta: (triton.cdiv(total_tokens * topk_main, meta['BLOCK_TK']),)
-    _gather_dequant_v32_kernel[grid_main](
-        kv_uint8_main, indices_main, topk_length_main_tensor,
-        output_kv, output_mask,
-        total_tokens, topk_main, num_blocks_main, block_size_main,
-        workload_main, 0, s_q,
-        stride_kv_block_main, stride_kv_token_main,
-        indices_main.stride(0), indices_main.stride(1),
-        output_kv.stride(0), output_kv.stride(1), output_kv.stride(2),
-        output_mask.stride(0), output_mask.stride(1),
-        D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
-        TILE_SIZE=V32_TILE_SIZE, NUM_TILES=V32_NUM_TILES,
-        HAS_TOPK_LENGTH=topk_length_main is not None,
-    )
+    total_elements_main = total_tokens * topk_main
+    total_elements_extra = total_tokens * topk_extra
 
-    grid_extra = lambda meta: (triton.cdiv(total_tokens * topk_extra, meta['BLOCK_TK']),)
-    _gather_dequant_v32_kernel[grid_extra](
-        kv_uint8_extra, indices_extra, topk_length_extra_tensor,
-        output_kv, output_mask,
-        total_tokens, topk_extra, num_blocks_extra, block_size_extra,
-        workload_extra, topk_main, s_q,
-        stride_kv_block_extra, stride_kv_token_extra,
-        indices_extra.stride(0), indices_extra.stride(1),
-        output_kv.stride(0), output_kv.stride(1), output_kv.stride(2),
-        output_mask.stride(0), output_mask.stride(1),
-        D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
-        TILE_SIZE=V32_TILE_SIZE, NUM_TILES=V32_NUM_TILES,
-        HAS_TOPK_LENGTH=topk_length_extra is not None,
-    )
+    USE_FIXED_KERNEL_THRESHOLD = 32768
+
+    if total_elements_main < USE_FIXED_KERNEL_THRESHOLD:
+        grid_main = (triton.cdiv(total_elements_main, 128),)
+        _gather_dequant_v32_kernel_fixed_128[grid_main](
+            kv_uint8_main, indices_main, topk_length_main_tensor,
+            output_kv, output_mask,
+            total_tokens, topk_main, num_blocks_main, block_size_main,
+            0, s_q, stride_kv_block_main, stride_kv_token_main,
+            stride_idx_t_main, stride_idx_k_main,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
+            TILE_SIZE=V32_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length_main,
+            num_warps=8, num_stages=2,
+        )
+    else:
+        workload_main = _get_workload_size_category(total_tokens, topk_main)
+        grid_main = lambda meta: (triton.cdiv(total_elements_main, meta['BLOCK_TK']),)
+        _gather_dequant_v32_kernel[grid_main](
+            kv_uint8_main, indices_main, topk_length_main_tensor,
+            output_kv, output_mask,
+            total_tokens, topk_main, num_blocks_main, block_size_main,
+            workload_main, 0, s_q, stride_kv_block_main, stride_kv_token_main,
+            stride_idx_t_main, stride_idx_k_main,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
+            TILE_SIZE=V32_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length_main,
+        )
+
+    if total_elements_extra < USE_FIXED_KERNEL_THRESHOLD:
+        grid_extra = (triton.cdiv(total_elements_extra, 128),)
+        _gather_dequant_v32_kernel_fixed_128[grid_extra](
+            kv_uint8_extra, indices_extra, topk_length_extra_tensor,
+            output_kv, output_mask,
+            total_tokens, topk_extra, num_blocks_extra, block_size_extra,
+            topk_main, s_q, stride_kv_block_extra, stride_kv_token_extra,
+            stride_idx_t_extra, stride_idx_k_extra,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
+            TILE_SIZE=V32_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length_extra,
+            num_warps=8, num_stages=2,
+        )
+    else:
+        workload_extra = _get_workload_size_category(total_tokens, topk_extra)
+        grid_extra = lambda meta: (triton.cdiv(total_elements_extra, meta['BLOCK_TK']),)
+        _gather_dequant_v32_kernel[grid_extra](
+            kv_uint8_extra, indices_extra, topk_length_extra_tensor,
+            output_kv, output_mask,
+            total_tokens, topk_extra, num_blocks_extra, block_size_extra,
+            workload_extra, topk_main, s_q, stride_kv_block_extra, stride_kv_token_extra,
+            stride_idx_t_extra, stride_idx_k_extra,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=V32_D_NOPE, D_ROPE=V32_D_ROPE,
+            TILE_SIZE=V32_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length_extra,
+        )
     return True
 
 
@@ -312,7 +676,6 @@ def triton_sparse_attn_decode_v32(
 
     for start_t, end_t in token_ranges:
         chunk_tokens = end_t - start_t
-
         q_chunk = q.reshape(total_tokens, h_q, d_qk)[start_t:end_t]
         q_input = q_chunk.reshape(chunk_tokens, 1, h_q, d_qk)
         chunk_kv_scope = slice_kv_scope_for_tokens(kv_scope, start_t, end_t, s_q)
