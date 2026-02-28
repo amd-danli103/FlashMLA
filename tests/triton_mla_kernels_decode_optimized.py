@@ -1,5 +1,5 @@
 """
-Optimized Triton MLA Decode Kernels - Version 12.0 (Fused Main+Extra Gather Interface)
+Optimized Triton MLA Decode Kernels - Version 13.0 (Fixed-config Attention for Small Workloads)
 
 Key optimizations:
 1. Fused Triton kernel for gather+dequant (significantly faster than PyTorch)
@@ -27,6 +27,11 @@ Key optimizations:
     - Pre-computes all parameters to minimize Python overhead
     - Note: True single-kernel fusion not possible due to Triton limitations
       with runtime pointer selection; launches two kernels back-to-back
+16. NEW: Fixed-config attention kernel for small workloads
+    - Uses fixed BLOCK_H=16, BLOCK_N=64, BLOCK_D=128 for small batches
+    - Avoids autotuning overhead (~20-50us per kernel launch)
+    - Threshold: total_tokens * h_q < 1024 AND total_topk <= 1024
+    - Large topk cases (>1024) use autotuned kernel for better performance
 """
 
 import torch
@@ -918,30 +923,197 @@ def _unified_sparse_decode_kernel(
     tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
 
 
+# ============================================================================
+# Fixed-config Attention Kernel for Small Workloads (no autotuning overhead)
+# ============================================================================
+
+@triton.jit
+def _unified_sparse_decode_kernel_fixed(
+    Q, KV, Mask, AttnSink,
+    Output, LSE,
+    sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
+    stride_q_t, stride_q_h, stride_q_d,
+    stride_kv_t, stride_kv_k, stride_kv_d,
+    stride_mask_t, stride_mask_k,
+    stride_o_t, stride_o_h, stride_o_d,
+    stride_lse_t, stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fixed-config attention kernel for small workloads (no autotuning)."""
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+
+    m_i = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    acc_0 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    acc_1 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    acc_2 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    acc_3 = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+
+    stride_q_t_64 = tl.cast(stride_q_t, tl.int64)
+    stride_kv_t_64 = tl.cast(stride_kv_t, tl.int64)
+    stride_mask_t_64 = tl.cast(stride_mask_t, tl.int64)
+    q_base = Q + pid_t_64 * stride_q_t_64
+    kv_base = KV + pid_t_64 * stride_kv_t_64
+    mask_base = Mask + pid_t_64 * stride_mask_t_64
+
+    for n_start in range(0, total_topk, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < total_topk
+
+        mask_ptrs = mask_base + offs_n * stride_mask_k
+        invalid = tl.load(mask_ptrs, mask=mask_n, other=True)
+        valid = mask_n & ~invalid
+
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+
+        for d_start in range(0, d_qk, BLOCK_D):
+            offs_d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < d_qk
+
+            q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
+            q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
+
+            k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
+            k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
+
+            qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
+
+        qk = qk * sm_scale
+        qk = tl.where(valid[None, :], qk, NEG_INF)
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
+        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
+        l_new = alpha * l_i + tl.sum(p, axis=1)
+        p_bf16 = p.to(tl.bfloat16)
+
+        offs_v = tl.arange(0, BLOCK_D)
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
+        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
+        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+
+        offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+
+        offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+
+        offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
+        v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
+        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+
+        m_i = m_new
+        l_i = l_new
+
+    lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
+    is_lonely_q = (l_i == 0.0)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        exp_attn_sink_minus_m = tl.math.exp2((attn_sink_vals - m_i) * LOG2E)
+        denominator = l_i + exp_attn_sink_minus_m
+        denominator = tl.where(denominator == 0.0, 1.0, denominator)
+        output_scale = 1.0 / denominator
+    else:
+        output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
+
+    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
+    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
+    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
+    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
+    lse = tl.where(is_lonely_q, POS_INF, lse)
+
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    tl.store(LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h, lse, mask=mask_h)
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64
+    offs_v = tl.arange(0, BLOCK_D)
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
+    offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_1.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
+    offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_2.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
+    offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
+    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
+
+
+
 def _run_unified_attention(q_reshaped, gathered_kv, invalid_mask,
                            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
                            attn_sink=None):
-    """Run unified attention with single KV buffer."""
+    """Run unified attention with single KV buffer.
+
+    Uses fixed-config kernel for small workloads to avoid autotuning overhead.
+    """
     output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
     lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
 
-    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
     HAS_ATTN_SINK = attn_sink is not None
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
-    _unified_sparse_decode_kernel[grid](
-        q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
-        output, lse,
-        sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
-        q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
-        gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
-        invalid_mask.stride(0), invalid_mask.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        lse.stride(0), lse.stride(1),
-        HAS_ATTN_SINK=HAS_ATTN_SINK,
-    )
-    return output, lse
+    # Use fixed-config kernel for small workloads to avoid autotuning overhead
+    # Conditions:
+    # 1. total_tokens * h_q < 1024 (small batch size)
+    # 2. total_topk <= 1024 (small topk - larger topk benefits from autotuning)
+    # This avoids regression on V3.2 cases with large topk (2048)
+    USE_FIXED_KERNEL_THRESHOLD = 1024
+    USE_FIXED_TOPK_THRESHOLD = 1024
 
+    if total_tokens * h_q < USE_FIXED_KERNEL_THRESHOLD and total_topk <= USE_FIXED_TOPK_THRESHOLD:
+        # Fixed config optimized for small workloads
+        BLOCK_H = 16
+        BLOCK_N = 64
+        BLOCK_D = 128
+        grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
+        _unified_sparse_decode_kernel_fixed[grid](
+            q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
+            output, lse,
+            sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
+            q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
+            gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
+            invalid_mask.stride(0), invalid_mask.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            lse.stride(0), lse.stride(1),
+            HAS_ATTN_SINK=HAS_ATTN_SINK,
+            BLOCK_H=BLOCK_H,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_D,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+        _unified_sparse_decode_kernel[grid](
+            q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
+            output, lse,
+            sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
+            q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
+            gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
+            invalid_mask.stride(0), invalid_mask.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            lse.stride(0), lse.stride(1),
+            HAS_ATTN_SINK=HAS_ATTN_SINK,
+        )
+    return output, lse
 
 def _run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
                                    d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
