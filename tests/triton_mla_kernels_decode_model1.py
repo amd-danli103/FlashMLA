@@ -519,29 +519,375 @@ def gather_dequant_fp8_model1(
     return True
 
 
+
+# ============================================================================
+# Truly Fused Gather Kernel - 2D Grid Approach
+# ============================================================================
+
+@triton.jit
+def _gather_dequant_model1_2d_kernel(
+    # Main KV cache
+    KV_Cache_Main,
+    Indices_Main,
+    TopkLength_Main,
+    # Extra KV cache
+    KV_Cache_Extra,
+    Indices_Extra,
+    TopkLength_Extra,
+    # Output
+    OutputKV,
+    OutputMask,
+    # Dimensions
+    total_tokens,
+    topk_main,
+    topk_extra,
+    num_blocks_main,
+    num_blocks_extra,
+    block_size_main,
+    block_size_extra,
+    s_q,
+    # Strides for main
+    stride_kv_block_main,
+    stride_idx_t_main, stride_idx_k_main,
+    # Strides for extra
+    stride_kv_block_extra,
+    stride_idx_t_extra, stride_idx_k_extra,
+    # Output strides
+    stride_out_t, stride_out_k, stride_out_d,
+    stride_mask_t, stride_mask_k,
+    # Grid info
+    num_main_pids,
+    # Constexpr
+    BLOCK_TK: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    BYTES_PER_TOKEN_DATA: tl.constexpr,
+    BYTES_PER_TOKEN_SCALE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HAS_TOPK_LENGTH_MAIN: tl.constexpr,
+    HAS_TOPK_LENGTH_EXTRA: tl.constexpr,
+):
+    """2D grid gather kernel - pid_y=0 for main, pid_y=1 for extra."""
+    pid_x = tl.program_id(0)
+    pid_y = tl.program_id(1)
+
+    # Determine if this is main or extra processing
+    is_main_pid = pid_y == 0
+
+    # Select parameters based on pid_y
+    if is_main_pid:
+        topk = topk_main
+        k_offset = 0
+        num_tk = total_tokens * topk_main
+        KV_Cache = KV_Cache_Main
+        Indices = Indices_Main
+        TopkLength = TopkLength_Main
+        block_size = block_size_main
+        stride_kv_block = stride_kv_block_main
+        stride_idx_t = stride_idx_t_main
+        stride_idx_k = stride_idx_k_main
+        HAS_TOPK_LENGTH = HAS_TOPK_LENGTH_MAIN
+    else:
+        topk = topk_extra
+        k_offset = topk_main
+        num_tk = total_tokens * topk_extra
+        KV_Cache = KV_Cache_Extra
+        Indices = Indices_Extra
+        TopkLength = TopkLength_Extra
+        block_size = block_size_extra
+        stride_kv_block = stride_kv_block_extra
+        stride_idx_t = stride_idx_t_extra
+        stride_idx_k = stride_idx_k_extra
+        HAS_TOPK_LENGTH = HAS_TOPK_LENGTH_EXTRA
+
+    # Compute element indices for this block
+    offs_tk = pid_x * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    mask_tk = offs_tk < num_tk
+
+    t_idx = offs_tk // topk
+    k_idx = offs_tk % topk
+
+    # Load indices
+    idx_ptrs = Indices + t_idx * stride_idx_t + k_idx * stride_idx_k
+    indices = tl.load(idx_ptrs, mask=mask_tk, other=-1)
+
+    is_invalid = indices == -1
+
+    if HAS_TOPK_LENGTH:
+        batch_idx = t_idx // s_q
+        topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+        is_invalid = is_invalid | (k_idx >= topk_len)
+
+    # Store mask
+    mask_out_ptrs = OutputMask + t_idx * stride_mask_t + (k_idx + k_offset) * stride_mask_k
+    tl.store(mask_out_ptrs, is_invalid, mask=mask_tk)
+
+    valid_mask = mask_tk & ~is_invalid
+    indices_clamped = tl.maximum(indices, 0)
+
+    block_idx = indices_clamped // block_size
+    offset_in_block = indices_clamped % block_size
+
+    block_idx_64 = block_idx.to(tl.int64)
+    offset_in_block_64 = offset_in_block.to(tl.int64)
+
+    kv_block_base = KV_Cache + block_idx_64 * stride_kv_block
+
+    nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+    scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+
+    t_idx_64 = t_idx.to(tl.int64)
+    k_idx_64 = k_idx.to(tl.int64)
+    stride_out_t_64 = tl.cast(stride_out_t, tl.int64)
+    stride_out_k_64 = tl.cast(stride_out_k, tl.int64)
+    out_base_ptrs = OutputKV + t_idx_64 * stride_out_t_64 + (k_idx_64 + k_offset) * stride_out_k_64
+
+    # Load all 7 scales
+    scale_ptrs_0 = kv_block_base + scale_base_offset
+    scale_uint8_0 = tl.load(scale_ptrs_0, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_1 = tl.load(scale_ptrs_0 + 1, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_2 = tl.load(scale_ptrs_0 + 2, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_3 = tl.load(scale_ptrs_0 + 3, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_4 = tl.load(scale_ptrs_0 + 4, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_5 = tl.load(scale_ptrs_0 + 5, mask=valid_mask, other=127).to(tl.uint8)
+    scale_uint8_6 = tl.load(scale_ptrs_0 + 6, mask=valid_mask, other=127).to(tl.uint8)
+
+    scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+
+    offs_d = tl.arange(0, TILE_SIZE)
+
+    # Process tile 0
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_0[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 1
+    tile_start_1 = TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_1 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_1[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_1 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 2
+    tile_start_2 = 2 * TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_2 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_2[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_2 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 3
+    tile_start_3 = 3 * TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_3 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_3[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_3 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 4
+    tile_start_4 = 4 * TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_4 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_4[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_4 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 5
+    tile_start_5 = 5 * TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_5 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_5[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_5 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process tile 6
+    tile_start_6 = 6 * TILE_SIZE
+    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_6 + offs_d[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    nope_bf16 = nope_fp8.to(tl.bfloat16)
+    dequant = nope_bf16 * scale_bf16_6[:, None]
+    dequant = tl.where(dequant != dequant, 0.0, dequant)
+    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
+    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
+    out_ptrs = out_base_ptrs[:, None] + (tile_start_6 + offs_d[None, :]) * stride_out_d
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+
+    # Process rope
+    offs_rope = tl.arange(0, D_ROPE)
+    rope_byte_start = D_NOPE
+    rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
+    rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_uint16 = rope_lo | (rope_hi << 8)
+    rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
+    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
+    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+
+
+
+def _prepare_kv_cache_flat(kv_cache):
+    """Helper to prepare KV cache for gather operations.
+    
+    Returns: (kv_flat, num_blocks, stride_kv_block)
+    """
+    kv_uint8 = kv_cache.view(torch.uint8)
+    num_blocks = kv_cache.shape[0]
+    bytes_per_block = kv_uint8.shape[1] * kv_uint8.shape[2] * kv_uint8.shape[3]
+    kv_flat = kv_uint8.reshape(num_blocks, bytes_per_block)
+    stride_kv_block = kv_uint8.stride(0)
+    return kv_flat, num_blocks, stride_kv_block
+
+
+def truly_fused_gather_dequant_fp8_model1(
+    kv_cache_main, indices_main, block_size_main, topk_length_main,
+    kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
+    output_kv, output_mask, s_q=1,
+):
+    """Truly fused MODEL1 gather - single kernel launch with 2D grid."""
+    total_tokens, topk_main = indices_main.shape
+    topk_extra = indices_extra.shape[1]
+    b = total_tokens // s_q  # batch size
+
+    kv_flat_main, num_blocks_main, stride_kv_block_main = _prepare_kv_cache_flat(kv_cache_main)
+    kv_flat_extra, num_blocks_extra, stride_kv_block_extra = _prepare_kv_cache_flat(kv_cache_extra)
+
+    has_topk_length_main = topk_length_main is not None
+    has_topk_length_extra = topk_length_extra is not None
+
+    # FIX: Always use int32 tensors for topk_length to avoid type mismatch in Triton
+    # When topk_length is None, create a dummy int32 tensor filled with the max topk value
+    if has_topk_length_main:
+        topk_length_main_tensor = topk_length_main
+    else:
+        # Create dummy tensor with max value (will be ignored due to HAS_TOPK_LENGTH=False)
+        topk_length_main_tensor = torch.full((b,), topk_main, dtype=torch.int32, device=indices_main.device)
+
+    if has_topk_length_extra:
+        topk_length_extra_tensor = topk_length_extra
+    else:
+        # Create dummy tensor with max value (will be ignored due to HAS_TOPK_LENGTH=False)
+        topk_length_extra_tensor = torch.full((b,), topk_extra, dtype=torch.int32, device=indices_extra.device)
+
+    stride_idx_t_main, stride_idx_k_main = indices_main.stride(0), indices_main.stride(1)
+    stride_idx_t_extra, stride_idx_k_extra = indices_extra.stride(0), indices_extra.stride(1)
+    stride_out_t, stride_out_k, stride_out_d = output_kv.stride(0), output_kv.stride(1), output_kv.stride(2)
+    stride_mask_t, stride_mask_k = output_mask.stride(0), output_mask.stride(1)
+
+    BLOCK_TK = 128
+
+    # Calculate grid sizes
+    num_elements_main = total_tokens * topk_main
+    num_elements_extra = total_tokens * topk_extra
+    num_main_pids = triton.cdiv(num_elements_main, BLOCK_TK)
+    num_extra_pids = triton.cdiv(num_elements_extra, BLOCK_TK)
+    max_pids = max(num_main_pids, num_extra_pids)
+
+    # 2D grid: (max_pids, 2) where y=0 is main, y=1 is extra
+    grid = (max_pids, 2)
+
+    _gather_dequant_model1_2d_kernel[grid](
+        kv_flat_main, indices_main, topk_length_main_tensor,
+        kv_flat_extra, indices_extra, topk_length_extra_tensor,
+        output_kv, output_mask,
+        total_tokens, topk_main, topk_extra,
+        num_blocks_main, num_blocks_extra,
+        block_size_main, block_size_extra,
+        s_q,
+        stride_kv_block_main,
+        stride_idx_t_main, stride_idx_k_main,
+        stride_kv_block_extra,
+        stride_idx_t_extra, stride_idx_k_extra,
+        stride_out_t, stride_out_k, stride_out_d,
+        stride_mask_t, stride_mask_k,
+        num_main_pids,
+        BLOCK_TK=BLOCK_TK,
+        D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
+        BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
+        BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
+        TILE_SIZE=MODEL1_TILE_SIZE,
+        HAS_TOPK_LENGTH_MAIN=has_topk_length_main,
+        HAS_TOPK_LENGTH_EXTRA=has_topk_length_extra,
+        num_warps=8, num_stages=2,
+    )
+    return True
+
+
 def fused_gather_dequant_fp8_model1(
     kv_cache_main, indices_main, block_size_main, topk_length_main,
     kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
     output_kv, output_mask, s_q=1,
 ):
-    """Fused MODEL1 gather - optimized wrapper for both scopes."""
-    total_tokens, topk_main = indices_main.shape
-    topk_extra = indices_extra.shape[1]
-
-    kv_uint8_main = kv_cache_main.view(torch.uint8)
-    num_blocks_main = kv_cache_main.shape[0]
-    bytes_per_block_main = kv_uint8_main.shape[1] * kv_uint8_main.shape[2] * kv_uint8_main.shape[3]
-    kv_flat_main = kv_uint8_main.reshape(num_blocks_main, bytes_per_block_main)
-    stride_kv_block_main = kv_uint8_main.stride(0)
-
-    kv_uint8_extra = kv_cache_extra.view(torch.uint8)
-    num_blocks_extra = kv_cache_extra.shape[0]
-    bytes_per_block_extra = kv_uint8_extra.shape[1] * kv_uint8_extra.shape[2] * kv_uint8_extra.shape[3]
-    kv_flat_extra = kv_uint8_extra.reshape(num_blocks_extra, bytes_per_block_extra)
-    stride_kv_block_extra = kv_uint8_extra.stride(0)
-
+    """Fused MODEL1 gather - uses 2D grid kernel for small workloads, two kernels for large."""
     has_topk_length_main = topk_length_main is not None
     has_topk_length_extra = topk_length_extra is not None
+
+    total_tokens, topk_main = indices_main.shape
+    topk_extra = indices_extra.shape[1]
+    total_elements = total_tokens * (topk_main + topk_extra)
+
+    # Use fused 2D grid kernel only for small workloads where kernel launch overhead matters
+    # For large workloads, the two-kernel approach is more efficient
+    USE_FUSED_THRESHOLD = 65536  # ~64K elements
+
+    # Now we can use fused kernel even when topk_length settings differ
+    # because we fixed the type mismatch issue by always using int32 tensors
+    use_fused = total_elements < USE_FUSED_THRESHOLD
+
+    if use_fused:
+        return truly_fused_gather_dequant_fp8_model1(
+            kv_cache_main, indices_main, block_size_main, topk_length_main,
+            kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
+            output_kv, output_mask, s_q,
+        )
+
+    # Use original two-kernel approach for large workloads
+    kv_flat_main, num_blocks_main, stride_kv_block_main = _prepare_kv_cache_flat(kv_cache_main)
+    kv_flat_extra, num_blocks_extra, stride_kv_block_extra = _prepare_kv_cache_flat(kv_cache_extra)
+
     topk_length_main_tensor = topk_length_main if has_topk_length_main else output_mask[:1, 0]
     topk_length_extra_tensor = topk_length_extra if has_topk_length_extra else output_mask[:1, 0]
 
@@ -625,11 +971,6 @@ def fused_gather_dequant_fp8_model1(
             HAS_TOPK_LENGTH=has_topk_length_extra,
         )
     return True
-
-
-# ============================================================================
-# MODEL1 Main Entry Point
-# ============================================================================
 
 def triton_sparse_attn_decode_model1(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
