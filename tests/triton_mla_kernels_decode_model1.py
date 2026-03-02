@@ -156,113 +156,109 @@ def _gather_dequant_model1_kernel(
 
     offs_d = tl.arange(0, TILE_SIZE)
 
+    # Pre-compute base pointers for optimization
+    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+    out_base = out_base_ptrs[:, None]
+
     # Process tile 0
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + offs_d[None, :]
+    nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_1 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_1 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_1 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_2 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_2 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_2 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_3 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_3 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_3 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_4 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_4 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_4 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_5 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_5 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_5 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_6 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_6 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_6 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
     rope_byte_start = D_NOPE
 
-    rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
-    rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
+    rope_lo_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2
+    rope_hi_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2 + 1
 
     rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
     rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
-    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
-    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+                         tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
-    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
 
@@ -362,113 +358,109 @@ def _gather_dequant_model1_kernel_fixed_128(
 
     offs_d = tl.arange(0, TILE_SIZE)
 
+    # Pre-compute base pointers for optimization
+    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+    out_base = out_base_ptrs[:, None]
+
     # Process tile 0
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + offs_d[None, :]
+    nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_1 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_1 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_1 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_2 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_2 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_2 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_3 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_3 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_3 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_4 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_4 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_4 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_5 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_5 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_5 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_6 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_6 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_6 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
     rope_byte_start = D_NOPE
 
-    rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
-    rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
+    rope_lo_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2
+    rope_hi_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2 + 1
 
     rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
     rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
-    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
-    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+                         tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
-    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
 
@@ -662,116 +654,112 @@ def _gather_dequant_model1_2d_kernel(
 
     offs_d = tl.arange(0, TILE_SIZE)
 
+    # Pre-compute base pointers for optimization
+    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+    out_base = out_base_ptrs[:, None]
+
     # Process tile 0
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + offs_d[None, :]
+    nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + offs_d[None, :] * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_1 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_1 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_1 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_2 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_2 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_2 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_3 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_3 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_3 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_4 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_4 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_4 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_5 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_5 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_5 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
-    nope_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + tile_start_6 + offs_d[None, :]
+    nope_ptrs = tile_base + tile_start_6 + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where(dequant != dequant, 0.0, dequant)
-    dequant = tl.maximum(tl.minimum(dequant, 65504.0), -65504.0)
-    dequant = tl.where(is_invalid[:, None], 0.0, dequant)
-    out_ptrs = out_base_ptrs[:, None] + (tile_start_6 + offs_d[None, :]) * stride_out_d
+    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+                       tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
+    out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
     rope_byte_start = D_NOPE
-    rope_lo_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2
-    rope_hi_ptrs = kv_block_base[:, None] + nope_rope_offset[:, None] + rope_byte_start + offs_rope[None, :] * 2 + 1
+    rope_lo_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2
+    rope_hi_ptrs = tile_base + rope_byte_start + offs_rope[None, :] * 2 + 1
     rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
     rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where(rope_bf16 != rope_bf16, 0.0, rope_bf16)
-    rope_bf16 = tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0)
-    rope_bf16 = tl.where(is_invalid[:, None], 0.0, rope_bf16)
-    out_ptrs = out_base_ptrs[:, None] + (D_NOPE + offs_rope[None, :]) * stride_out_d
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+                         tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
+    out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
 
 
 
 def _prepare_kv_cache_flat(kv_cache):
     """Helper to prepare KV cache for gather operations.
-    
+
     Returns: (kv_flat, num_blocks, stride_kv_block)
     """
     kv_uint8 = kv_cache.view(torch.uint8)
