@@ -516,8 +516,13 @@ def gather_dequant_fp8_model1(
 # Truly Fused Gather Kernel - 2D Grid Approach
 # ============================================================================
 
+# ============================================================================
+# MODEL1 1D Grid Fused Gather+Dequant Kernel (Optimized - No Empty Blocks)
+# Single kernel launch with 1D grid: (num_main_pids + num_extra_pids,)
+# ============================================================================
+
 @triton.jit
-def _gather_dequant_model1_2d_kernel(
+def _gather_dequant_model1_1d_fused_kernel(
     # Main KV cache
     KV_Cache_Main,
     Indices_Main,
@@ -559,15 +564,22 @@ def _gather_dequant_model1_2d_kernel(
     HAS_TOPK_LENGTH_MAIN: tl.constexpr,
     HAS_TOPK_LENGTH_EXTRA: tl.constexpr,
 ):
-    """2D grid gather kernel - pid_y=0 for main, pid_y=1 for extra."""
-    pid_x = tl.program_id(0)
-    pid_y = tl.program_id(1)
+    """1D fused gather kernel - single launch, no empty blocks.
+
+    Grid: (num_main_pids + num_extra_pids,)
+    - pid < num_main_pids: process main cache
+    - pid >= num_main_pids: process extra cache
+
+    This eliminates empty blocks when main/extra topk differ significantly.
+    """
+    pid = tl.program_id(0)
 
     # Determine if this is main or extra processing
-    is_main_pid = pid_y == 0
+    is_main_pid = pid < num_main_pids
 
-    # Select parameters based on pid_y
+    # Select parameters based on pid
     if is_main_pid:
+        local_pid = pid
         topk = topk_main
         k_offset = 0
         num_tk = total_tokens * topk_main
@@ -578,8 +590,8 @@ def _gather_dequant_model1_2d_kernel(
         stride_kv_block = stride_kv_block_main
         stride_idx_t = stride_idx_t_main
         stride_idx_k = stride_idx_k_main
-        HAS_TOPK_LENGTH = HAS_TOPK_LENGTH_MAIN
     else:
+        local_pid = pid - num_main_pids
         topk = topk_extra
         k_offset = topk_main
         num_tk = total_tokens * topk_extra
@@ -590,10 +602,9 @@ def _gather_dequant_model1_2d_kernel(
         stride_kv_block = stride_kv_block_extra
         stride_idx_t = stride_idx_t_extra
         stride_idx_k = stride_idx_k_extra
-        HAS_TOPK_LENGTH = HAS_TOPK_LENGTH_EXTRA
 
     # Compute element indices for this block
-    offs_tk = pid_x * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    offs_tk = local_pid * BLOCK_TK + tl.arange(0, BLOCK_TK)
     mask_tk = offs_tk < num_tk
 
     t_idx = offs_tk // topk
@@ -605,10 +616,16 @@ def _gather_dequant_model1_2d_kernel(
 
     is_invalid = indices == -1
 
-    if HAS_TOPK_LENGTH:
-        batch_idx = t_idx // s_q
-        topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
-        is_invalid = is_invalid | (k_idx >= topk_len)
+    # Handle topk_length - need to handle both cases
+    batch_idx = t_idx // s_q
+    if is_main_pid:
+        if HAS_TOPK_LENGTH_MAIN:
+            topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+            is_invalid = is_invalid | (k_idx >= topk_len)
+    else:
+        if HAS_TOPK_LENGTH_EXTRA:
+            topk_len = tl.load(TopkLength + batch_idx, mask=mask_tk, other=topk)
+            is_invalid = is_invalid | (k_idx >= topk_len)
 
     # Store mask
     mask_out_ptrs = OutputMask + t_idx * stride_mask_t + (k_idx + k_offset) * stride_mask_k
@@ -775,7 +792,7 @@ def truly_fused_gather_dequant_fp8_model1(
     kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
     output_kv, output_mask, s_q=1,
 ):
-    """Truly fused MODEL1 gather - single kernel launch with 2D grid."""
+    """Truly fused MODEL1 gather - single kernel launch with 1D grid (no empty blocks)."""
     total_tokens, topk_main = indices_main.shape
     topk_extra = indices_extra.shape[1]
     b = total_tokens // s_q  # batch size
@@ -786,18 +803,15 @@ def truly_fused_gather_dequant_fp8_model1(
     has_topk_length_main = topk_length_main is not None
     has_topk_length_extra = topk_length_extra is not None
 
-    # FIX: Always use int32 tensors for topk_length to avoid type mismatch in Triton
-    # When topk_length is None, create a dummy int32 tensor filled with the max topk value
+    # Always use int32 tensors for topk_length to avoid type mismatch in Triton
     if has_topk_length_main:
         topk_length_main_tensor = topk_length_main
     else:
-        # Create dummy tensor with max value (will be ignored due to HAS_TOPK_LENGTH=False)
         topk_length_main_tensor = torch.full((b,), topk_main, dtype=torch.int32, device=indices_main.device)
 
     if has_topk_length_extra:
         topk_length_extra_tensor = topk_length_extra
     else:
-        # Create dummy tensor with max value (will be ignored due to HAS_TOPK_LENGTH=False)
         topk_length_extra_tensor = torch.full((b,), topk_extra, dtype=torch.int32, device=indices_extra.device)
 
     stride_idx_t_main, stride_idx_k_main = indices_main.stride(0), indices_main.stride(1)
@@ -807,17 +821,16 @@ def truly_fused_gather_dequant_fp8_model1(
 
     BLOCK_TK = 128
 
-    # Calculate grid sizes
+    # Calculate grid sizes - 1D grid with exact number of needed blocks
     num_elements_main = total_tokens * topk_main
     num_elements_extra = total_tokens * topk_extra
     num_main_pids = triton.cdiv(num_elements_main, BLOCK_TK)
     num_extra_pids = triton.cdiv(num_elements_extra, BLOCK_TK)
-    max_pids = max(num_main_pids, num_extra_pids)
 
-    # 2D grid: (max_pids, 2) where y=0 is main, y=1 is extra
-    grid = (max_pids, 2)
+    # 1D grid: (num_main_pids + num_extra_pids,) - no empty blocks!
+    grid = (num_main_pids + num_extra_pids,)
 
-    _gather_dequant_model1_2d_kernel[grid](
+    _gather_dequant_model1_1d_fused_kernel[grid](
         kv_flat_main, indices_main, topk_length_main_tensor,
         kv_flat_extra, indices_extra, topk_length_extra_tensor,
         output_kv, output_mask,
@@ -849,7 +862,7 @@ def fused_gather_dequant_fp8_model1(
     kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
     output_kv, output_mask, s_q=1,
 ):
-    """Fused MODEL1 gather - uses 2D grid kernel for small workloads, two kernels for large."""
+    """Fused MODEL1 gather - uses 1D fused kernel for small workloads, two kernels for large."""
     has_topk_length_main = topk_length_main is not None
     has_topk_length_extra = topk_length_extra is not None
 
@@ -859,7 +872,7 @@ def fused_gather_dequant_fp8_model1(
 
     # Use fused 2D grid kernel only for small workloads where kernel launch overhead matters
     # For large workloads, the two-kernel approach is more efficient
-    USE_FUSED_THRESHOLD = 65536  # ~64K elements
+    USE_FUSED_THRESHOLD = 150000  # ~150K elements - balanced for 1D grid performance
 
     # Now we can use fused kernel even when topk_length settings differ
     # because we fixed the type mismatch issue by always using int32 tensors
