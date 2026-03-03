@@ -33,6 +33,19 @@ MODEL1_NUM_TILES = 7
 MODEL1_BYTES_PER_TOKEN_DATA = 576  # 448 nope + 128 rope
 MODEL1_BYTES_PER_TOKEN_SCALE = 8   # 7 scales + 1 padding
 
+# Performance tuning thresholds (empirically determined)
+# These thresholds balance kernel launch overhead vs. computation efficiency
+#
+# MODEL1_USE_FUSED_THRESHOLD: Use 1D fused kernel below this element count
+#   Rationale: Single kernel launch reduces overhead for small/medium workloads
+#   Value 150K determined by benchmarking on typical production workloads
+MODEL1_USE_FUSED_THRESHOLD = 150000
+#
+# MODEL1_USE_FIXED_KERNEL_THRESHOLD: Use fixed BLOCK_TK=128 kernel below this
+#   Rationale: Avoids autotune overhead for small workloads where fixed config
+#   performs well. Value 32K balances autotune benefit vs. overhead
+MODEL1_USE_FIXED_KERNEL_THRESHOLD = 32768
+
 
 # ============================================================================
 # MODEL1 Gather+Dequant Kernels - Optimized with Batched Scale Loading
@@ -881,7 +894,7 @@ def fused_gather_dequant_fp8_model1(
 
     # Use fused 2D grid kernel only for small workloads where kernel launch overhead matters
     # For large workloads, the two-kernel approach is more efficient
-    USE_FUSED_THRESHOLD = 150000  # ~150K elements - balanced for 1D grid performance
+    USE_FUSED_THRESHOLD = MODEL1_USE_FUSED_THRESHOLD
 
     # Now we can use fused kernel even when topk_length settings differ
     # because we fixed the type mismatch issue by always using int32 tensors
@@ -909,7 +922,7 @@ def fused_gather_dequant_fp8_model1(
     total_elements_main = total_tokens * topk_main
     total_elements_extra = total_tokens * topk_extra
 
-    USE_FIXED_KERNEL_THRESHOLD = 32768
+    USE_FIXED_KERNEL_THRESHOLD = MODEL1_USE_FIXED_KERNEL_THRESHOLD
 
     if total_elements_main < USE_FIXED_KERNEL_THRESHOLD:
         grid_main = (triton.cdiv(total_elements_main, 128),)

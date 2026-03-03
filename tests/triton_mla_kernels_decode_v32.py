@@ -32,12 +32,35 @@ os.makedirs(TRITON_CACHE_DIR, exist_ok=True)
 os.environ.setdefault("TRITON_CACHE_DIR", TRITON_CACHE_DIR)
 
 # Constants for V32 layout
-V32_D_QK = 576
-V32_D_NOPE = 512
-V32_D_ROPE = 64
-V32_TILE_SIZE = 128
-V32_NUM_TILES = 4
-V32_BYTES_PER_TOKEN = 656
+V32_D_QK = 576          # Total query/key dimension
+V32_D_NOPE = 512        # Non-positional embedding dimension
+V32_D_ROPE = 64         # Rotary positional embedding dimension
+V32_TILE_SIZE = 128     # Size of each tile for processing
+V32_NUM_TILES = 4       # Number of tiles (D_NOPE / TILE_SIZE = 512 / 128 = 4)
+V32_BYTES_PER_TOKEN = 656  # Total bytes per token in KV cache
+
+# Derived constants for V32
+V32_CHUNK_SIZE = 64     # Each tile is processed in 2 chunks of 64 elements
+V32_SCALE_BYTES = 4     # Each scale is 4 bytes (float32)
+V32_NUM_SCALES = 4      # Number of scales (one per tile)
+V32_TOTAL_SCALE_BYTES = V32_NUM_SCALES * V32_SCALE_BYTES  # 16 bytes total for scales
+
+# Numeric constants
+BF16_MAX = 65504.0      # Maximum value for bfloat16 (used for clamping)
+
+# Performance tuning thresholds (empirically determined)
+# These thresholds balance kernel launch overhead vs. computation efficiency
+#
+# V32_USE_FUSED_THRESHOLD: Use 1D fused kernel below this element count
+#   Rationale: Single kernel launch reduces overhead for small/medium workloads
+#   Value 150K determined by benchmarking on typical production workloads
+V32_USE_FUSED_THRESHOLD = 150000
+#
+# V32_USE_FIXED_KERNEL_THRESHOLD: Use fixed BLOCK_TK=128 kernel below this
+#   Rationale: Avoids autotune overhead for small workloads where fixed config
+#   performs well. Value 32K balances autotune benefit vs. overhead
+V32_USE_FIXED_KERNEL_THRESHOLD = 32768
+
 
 
 # ============================================================================
@@ -169,7 +192,7 @@ def _gather_dequant_v32_kernel(
                       (scale_b2_3.to(tl.uint32) << 16) | (scale_b3_3.to(tl.uint32) << 24))
     scale_f32_3 = scale_uint32_3.to(tl.float32, bitcast=True)
 
-    offs_d = tl.arange(0, 64)
+    offs_d = tl.arange(0, 64)  # CHUNK_SIZE: each tile processed in 2 chunks of 64
 
     # Pre-compute base pointers for optimization
     tile_base = kv_base_ptrs[:, None]
@@ -178,6 +201,7 @@ def _gather_dequant_v32_kernel(
     is_invalid_2d = is_invalid[:, None]
     mask_tk_2d = mask_tk[:, None]
 
+    # Dequantization: clamp to BF16_MAX (65504.0) to handle NaN/Inf values
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
@@ -267,7 +291,7 @@ def _gather_dequant_v32_kernel(
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope (bytes after scales: D_NOPE + NUM_TILES * 4 = 512 + 16 = 528)
-    rope_byte_offset = D_NOPE + 16
+    rope_byte_offset = D_NOPE + 16  # Skip 4 scales * 4 bytes = 16 bytes
     offs_rope = tl.arange(0, D_ROPE)
 
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
@@ -384,7 +408,7 @@ def _gather_dequant_v32_kernel_fixed_128(
                       (scale_b2_3.to(tl.uint32) << 16) | (scale_b3_3.to(tl.uint32) << 24))
     scale_f32_3 = scale_uint32_3.to(tl.float32, bitcast=True)
 
-    offs_d = tl.arange(0, 64)
+    offs_d = tl.arange(0, 64)  # CHUNK_SIZE: each tile processed in 2 chunks of 64
 
     # Pre-compute base pointers for optimization
     tile_base = kv_base_ptrs[:, None]
@@ -393,6 +417,7 @@ def _gather_dequant_v32_kernel_fixed_128(
     is_invalid_2d = is_invalid[:, None]
     mask_tk_2d = mask_tk[:, None]
 
+    # Dequantization: clamp to BF16_MAX (65504.0) to handle NaN/Inf values
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
@@ -482,7 +507,7 @@ def _gather_dequant_v32_kernel_fixed_128(
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope
-    rope_byte_offset = D_NOPE + 16
+    rope_byte_offset = D_NOPE + 16  # Skip 4 scales * 4 bytes = 16 bytes
     offs_rope = tl.arange(0, D_ROPE)
 
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
@@ -685,12 +710,13 @@ def _gather_dequant_v32_1d_fused_kernel(
     scale_uint8_2 = tl.load(scale_ptrs_0 + 2, mask=valid_mask, other=127).to(tl.uint8)
     scale_uint8_3 = tl.load(scale_ptrs_0 + 3, mask=valid_mask, other=127).to(tl.uint8)
 
+    # E8M0 scale format: exponent-only, bias=127, scale = 2^(uint8 - 127)
     scale_f32_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0)
     scale_f32_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0)
     scale_f32_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0)
     scale_f32_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0)
 
-    offs_d = tl.arange(0, 64)  # Process 64 elements at a time
+    offs_d = tl.arange(0, 64)  # CHUNK_SIZE: each tile processed in 2 chunks of 64
 
     tile_base = kv_base_ptrs[:, None]
     out_base = out_base_ptrs[:, None]
@@ -698,6 +724,7 @@ def _gather_dequant_v32_1d_fused_kernel(
     is_invalid_2d = is_invalid[:, None]
     mask_tk_2d = mask_tk[:, None]
 
+    # Dequantization: clamp to BF16_MAX (65504.0) to handle NaN/Inf values
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
@@ -787,7 +814,7 @@ def _gather_dequant_v32_1d_fused_kernel(
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope (bytes after scales: D_NOPE + NUM_TILES * 4 = 512 + 16 = 528)
-    rope_byte_offset = D_NOPE + 16
+    rope_byte_offset = D_NOPE + 16  # Skip 4 scales * 4 bytes = 16 bytes
     offs_rope = tl.arange(0, D_ROPE)
 
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
@@ -891,7 +918,7 @@ def fused_gather_dequant_fp8_v32(
     total_elements = total_tokens * (topk_main + topk_extra)
 
     # Use 1D fused kernel for workloads below threshold (single kernel launch, no empty blocks)
-    USE_FUSED_THRESHOLD = 150000  # ~150K elements - balanced for 1D grid performance
+    USE_FUSED_THRESHOLD = V32_USE_FUSED_THRESHOLD
 
     if total_elements < USE_FUSED_THRESHOLD:
         return truly_fused_gather_dequant_fp8_v32(
@@ -925,7 +952,7 @@ def fused_gather_dequant_fp8_v32(
     total_elements_main = total_tokens * topk_main
     total_elements_extra = total_tokens * topk_extra
 
-    USE_FIXED_KERNEL_THRESHOLD = 32768
+    USE_FIXED_KERNEL_THRESHOLD = V32_USE_FIXED_KERNEL_THRESHOLD
 
     if total_elements_main < USE_FIXED_KERNEL_THRESHOLD:
         grid_main = (triton.cdiv(total_elements_main, 128),)
