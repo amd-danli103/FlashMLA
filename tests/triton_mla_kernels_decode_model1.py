@@ -529,12 +529,6 @@ def gather_dequant_fp8_model1(
     )
     return True
 
-
-
-# ============================================================================
-# Truly Fused Gather Kernel - 2D Grid Approach
-# ============================================================================
-
 # ============================================================================
 # MODEL1 1D Grid Fused Gather+Dequant Kernel (Optimized - No Empty Blocks)
 # Single kernel launch with 1D grid: (num_main_pids + num_extra_pids,)
@@ -809,6 +803,58 @@ def _prepare_kv_cache_flat(kv_cache):
     return kv_flat, num_blocks, stride_kv_block
 
 
+def _launch_gather_dequant_one_model1(
+    kv_flat, indices, topk_length_tensor, output_kv, output_mask,
+    total_tokens, topk, num_blocks, block_size, k_offset, s_q,
+    stride_kv_block, stride_idx_t, stride_idx_k,
+    stride_out_t, stride_out_k, stride_out_d,
+    stride_mask_t, stride_mask_k,
+    has_topk_length,
+):
+    """Helper to launch gather+dequant kernel for one KV cache (main or extra).
+
+    This eliminates code duplication between main and extra kernel launches
+    in the two-kernel path of fused_gather_dequant_fp8_model1.
+    """
+    total_elements = total_tokens * topk
+
+    if total_elements < MODEL1_USE_FIXED_KERNEL_THRESHOLD:
+        grid = (triton.cdiv(total_elements, 128),)
+        _gather_dequant_model1_kernel_fixed_128[grid](
+            kv_flat, indices, topk_length_tensor,
+            output_kv, output_mask,
+            total_tokens, topk, num_blocks, block_size,
+            k_offset, s_q, stride_kv_block,
+            stride_idx_t, stride_idx_k,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
+            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
+            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
+            TILE_SIZE=MODEL1_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length,
+            num_warps=8, num_stages=2,
+        )
+    else:
+        workload_cat = _get_workload_size_category(total_tokens, topk)
+        grid = lambda meta: (triton.cdiv(total_elements, meta['BLOCK_TK']),)
+        _gather_dequant_model1_kernel[grid](
+            kv_flat, indices, topk_length_tensor,
+            output_kv, output_mask,
+            total_tokens, topk, num_blocks, block_size,
+            workload_cat, k_offset, s_q, stride_kv_block,
+            stride_idx_t, stride_idx_k,
+            stride_out_t, stride_out_k, stride_out_d,
+            stride_mask_t, stride_mask_k,
+            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
+            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
+            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
+            TILE_SIZE=MODEL1_TILE_SIZE,
+            HAS_TOPK_LENGTH=has_topk_length,
+        )
+
+
+
 def truly_fused_gather_dequant_fp8_model1(
     kv_cache_main, indices_main, block_size_main, topk_length_main,
     kv_cache_extra, indices_extra, block_size_extra, topk_length_extra,
@@ -919,80 +965,30 @@ def fused_gather_dequant_fp8_model1(
     stride_out_t, stride_out_k, stride_out_d = output_kv.stride(0), output_kv.stride(1), output_kv.stride(2)
     stride_mask_t, stride_mask_k = output_mask.stride(0), output_mask.stride(1)
 
-    total_elements_main = total_tokens * topk_main
-    total_elements_extra = total_tokens * topk_extra
+    # Launch main kernel
+    _launch_gather_dequant_one_model1(
+        kv_flat_main, indices_main, topk_length_main_tensor,
+        output_kv, output_mask,
+        total_tokens, topk_main, num_blocks_main, block_size_main,
+        0, s_q, stride_kv_block_main,
+        stride_idx_t_main, stride_idx_k_main,
+        stride_out_t, stride_out_k, stride_out_d,
+        stride_mask_t, stride_mask_k,
+        has_topk_length_main,
+    )
 
-    USE_FIXED_KERNEL_THRESHOLD = MODEL1_USE_FIXED_KERNEL_THRESHOLD
+    # Launch extra kernel
+    _launch_gather_dequant_one_model1(
+        kv_flat_extra, indices_extra, topk_length_extra_tensor,
+        output_kv, output_mask,
+        total_tokens, topk_extra, num_blocks_extra, block_size_extra,
+        topk_main, s_q, stride_kv_block_extra,
+        stride_idx_t_extra, stride_idx_k_extra,
+        stride_out_t, stride_out_k, stride_out_d,
+        stride_mask_t, stride_mask_k,
+        has_topk_length_extra,
+    )
 
-    if total_elements_main < USE_FIXED_KERNEL_THRESHOLD:
-        grid_main = (triton.cdiv(total_elements_main, 128),)
-        _gather_dequant_model1_kernel_fixed_128[grid_main](
-            kv_flat_main, indices_main, topk_length_main_tensor,
-            output_kv, output_mask,
-            total_tokens, topk_main, num_blocks_main, block_size_main,
-            0, s_q, stride_kv_block_main,
-            stride_idx_t_main, stride_idx_k_main,
-            stride_out_t, stride_out_k, stride_out_d,
-            stride_mask_t, stride_mask_k,
-            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
-            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
-            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
-            TILE_SIZE=MODEL1_TILE_SIZE,
-            HAS_TOPK_LENGTH=has_topk_length_main,
-            num_warps=8, num_stages=2,
-        )
-    else:
-        workload_main = _get_workload_size_category(total_tokens, topk_main)
-        grid_main = lambda meta: (triton.cdiv(total_elements_main, meta['BLOCK_TK']),)
-        _gather_dequant_model1_kernel[grid_main](
-            kv_flat_main, indices_main, topk_length_main_tensor,
-            output_kv, output_mask,
-            total_tokens, topk_main, num_blocks_main, block_size_main,
-            workload_main, 0, s_q, stride_kv_block_main,
-            stride_idx_t_main, stride_idx_k_main,
-            stride_out_t, stride_out_k, stride_out_d,
-            stride_mask_t, stride_mask_k,
-            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
-            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
-            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
-            TILE_SIZE=MODEL1_TILE_SIZE,
-            HAS_TOPK_LENGTH=has_topk_length_main,
-        )
-
-    if total_elements_extra < USE_FIXED_KERNEL_THRESHOLD:
-        grid_extra = (triton.cdiv(total_elements_extra, 128),)
-        _gather_dequant_model1_kernel_fixed_128[grid_extra](
-            kv_flat_extra, indices_extra, topk_length_extra_tensor,
-            output_kv, output_mask,
-            total_tokens, topk_extra, num_blocks_extra, block_size_extra,
-            topk_main, s_q, stride_kv_block_extra,
-            stride_idx_t_extra, stride_idx_k_extra,
-            stride_out_t, stride_out_k, stride_out_d,
-            stride_mask_t, stride_mask_k,
-            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
-            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
-            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
-            TILE_SIZE=MODEL1_TILE_SIZE,
-            HAS_TOPK_LENGTH=has_topk_length_extra,
-            num_warps=8, num_stages=2,
-        )
-    else:
-        workload_extra = _get_workload_size_category(total_tokens, topk_extra)
-        grid_extra = lambda meta: (triton.cdiv(total_elements_extra, meta['BLOCK_TK']),)
-        _gather_dequant_model1_kernel[grid_extra](
-            kv_flat_extra, indices_extra, topk_length_extra_tensor,
-            output_kv, output_mask,
-            total_tokens, topk_extra, num_blocks_extra, block_size_extra,
-            workload_extra, topk_main, s_q, stride_kv_block_extra,
-            stride_idx_t_extra, stride_idx_k_extra,
-            stride_out_t, stride_out_k, stride_out_d,
-            stride_mask_t, stride_mask_k,
-            D_NOPE=MODEL1_D_NOPE, D_ROPE=MODEL1_D_ROPE,
-            BYTES_PER_TOKEN_DATA=MODEL1_BYTES_PER_TOKEN_DATA,
-            BYTES_PER_TOKEN_SCALE=MODEL1_BYTES_PER_TOKEN_SCALE,
-            TILE_SIZE=MODEL1_TILE_SIZE,
-            HAS_TOPK_LENGTH=has_topk_length_extra,
-        )
     return True
 
 def triton_sparse_attn_decode_model1(
