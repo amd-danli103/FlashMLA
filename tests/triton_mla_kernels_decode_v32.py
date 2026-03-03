@@ -174,94 +174,97 @@ def _gather_dequant_v32_kernel(
     # Pre-compute base pointers for optimization
     tile_base = kv_base_ptrs[:, None]
     out_base = out_base_ptrs[:, None]
+    valid_mask_2d = valid_mask[:, None]
+    is_invalid_2d = is_invalid[:, None]
+    mask_tk_2d = mask_tk[:, None]
 
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 0, chunk 1
     nope_ptrs = tile_base + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 0
     nope_ptrs = tile_base + TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 1
     nope_ptrs = tile_base + TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 0
     nope_ptrs = tile_base + 2*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 1
     nope_ptrs = tile_base + 2*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 0
     nope_ptrs = tile_base + 3*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 1
     nope_ptrs = tile_base + 3*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope (bytes after scales: D_NOPE + NUM_TILES * 4 = 512 + 16 = 528)
     rope_byte_offset = D_NOPE + 16
@@ -270,16 +273,16 @@ def _gather_dequant_v32_kernel(
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
     rope_hi_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2 + 1
 
-    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
 
 
 @triton.jit
@@ -386,94 +389,97 @@ def _gather_dequant_v32_kernel_fixed_128(
     # Pre-compute base pointers for optimization
     tile_base = kv_base_ptrs[:, None]
     out_base = out_base_ptrs[:, None]
+    valid_mask_2d = valid_mask[:, None]
+    is_invalid_2d = is_invalid[:, None]
+    mask_tk_2d = mask_tk[:, None]
 
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 0, chunk 1
     nope_ptrs = tile_base + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 0
     nope_ptrs = tile_base + TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 1
     nope_ptrs = tile_base + TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 0
     nope_ptrs = tile_base + 2*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 1
     nope_ptrs = tile_base + 2*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 0
     nope_ptrs = tile_base + 3*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 1
     nope_ptrs = tile_base + 3*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope
     rope_byte_offset = D_NOPE + 16
@@ -482,16 +488,16 @@ def _gather_dequant_v32_kernel_fixed_128(
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
     rope_hi_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2 + 1
 
-    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
 
 
 # ============================================================================
@@ -688,94 +694,97 @@ def _gather_dequant_v32_1d_fused_kernel(
 
     tile_base = kv_base_ptrs[:, None]
     out_base = out_base_ptrs[:, None]
+    valid_mask_2d = valid_mask[:, None]
+    is_invalid_2d = is_invalid[:, None]
+    mask_tk_2d = mask_tk[:, None]
 
     # Tile 0, chunk 0
     nope_ptrs = tile_base + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 0, chunk 1
     nope_ptrs = tile_base + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 0
     nope_ptrs = tile_base + TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 1, chunk 1
     nope_ptrs = tile_base + TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 0
     nope_ptrs = tile_base + 2*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 2, chunk 1
     nope_ptrs = tile_base + 2*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (2*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 0
     nope_ptrs = tile_base + 3*TILE_SIZE + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Tile 3, chunk 1
     nope_ptrs = tile_base + 3*TILE_SIZE + 64 + offs_d[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask[:, None], other=0)
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_f32 = nope_fp8.to(tl.float32)
     dequant = nope_f32 * scale_f32_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid[:, None], 0.0,
+    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (3*TILE_SIZE + 64 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
 
     # Process rope (bytes after scales: D_NOPE + NUM_TILES * 4 = 512 + 16 = 528)
     rope_byte_offset = D_NOPE + 16
@@ -784,16 +793,16 @@ def _gather_dequant_v32_1d_fused_kernel(
     rope_lo_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2
     rope_hi_ptrs = tile_base + rope_byte_offset + offs_rope[None, :] * 2 + 1
 
-    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask[:, None], other=0).to(tl.uint16)
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid[:, None], 0.0,
+    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk[:, None])
+    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
 
 
 def truly_fused_gather_dequant_fp8_v32(
