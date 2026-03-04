@@ -1070,7 +1070,10 @@ def _triton_sparse_attn_decode_v32_impl(
     q: torch.Tensor, kv_scope, extra_kv_scope, sm_scale: float,
     d_v: int = 512, attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Internal implementation of sparse attention decode for V3.2."""
+    """Internal implementation of sparse attention decode for V3.2.
+
+    Assumes KV cache is always FP8 quantized (blocked_k_quantized is not None).
+    """
     assert kv_scope is not None
     b, s_q, h_q, d_qk = q.shape
     total_tokens = b * s_q
@@ -1085,11 +1088,8 @@ def _triton_sparse_attn_decode_v32_impl(
     block_size_main = kv_scope.blocked_k.shape[1]
     indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
 
-    use_fused = (kv_scope.blocked_k_quantized is not None and
-                 extra_kv_scope is not None and
-                 extra_kv_scope.blocked_k_quantized is not None)
-
-    if use_fused:
+    if extra_kv_scope is not None:
+        # Fused gather for both main and extra scope
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra)
         fused_gather_dequant_fp8_v32(
@@ -1097,47 +1097,10 @@ def _triton_sparse_attn_decode_v32_impl(
             extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, extra_kv_scope.topk_length,
             gathered_kv, invalid_mask, s_q)
     else:
-        if kv_scope.blocked_k_quantized is not None:
-            gather_dequant_fp8_v32(
-                kv_scope.blocked_k_quantized, indices_main, block_size_main,
-                gathered_kv, invalid_mask, 0,
-                kv_scope.topk_length, s_q)
-        else:
-            scope_invalid_mask = indices_main == -1
-            if kv_scope.topk_length is not None:
-                topk_length_mask = (
-                    torch.arange(0, topk_main, device=q.device).view(1, 1, topk_main).broadcast_to(b, s_q, topk_main)
-                    >= kv_scope.topk_length.view(b, 1, 1)
-                ).reshape(total_tokens, topk_main)
-                scope_invalid_mask = scope_invalid_mask | topk_length_mask
-            invalid_mask[:, :topk_main] = scope_invalid_mask
-            indices_clamped = torch.clamp(indices_main, min=0)
-            kv_gathered = kv_scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk_main, d_qk).to(torch.bfloat16)
-            kv_gathered[scope_invalid_mask] = 0
-            gathered_kv[:, :topk_main, :] = kv_gathered
-
-        if extra_kv_scope is not None:
-            block_size_extra = extra_kv_scope.blocked_k.shape[1]
-            indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra)
-
-            if extra_kv_scope.blocked_k_quantized is not None:
-                gather_dequant_fp8_v32(
-                    extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra,
-                    gathered_kv, invalid_mask, topk_main,
-                    extra_kv_scope.topk_length, s_q)
-            else:
-                scope_invalid_mask = indices_extra == -1
-                if extra_kv_scope.topk_length is not None:
-                    topk_length_mask = (
-                        torch.arange(0, topk_extra, device=q.device).view(1, 1, topk_extra).broadcast_to(b, s_q, topk_extra)
-                        >= extra_kv_scope.topk_length.view(b, 1, 1)
-                    ).reshape(total_tokens, topk_extra)
-                    scope_invalid_mask = scope_invalid_mask | topk_length_mask
-                invalid_mask[:, topk_main:] = scope_invalid_mask
-                indices_clamped = torch.clamp(indices_extra, min=0)
-                kv_gathered = extra_kv_scope.blocked_k.view(-1, d_qk).index_select(0, indices_clamped.view(-1)).view(total_tokens, topk_extra, d_qk).to(torch.bfloat16)
-                kv_gathered[scope_invalid_mask] = 0
-                gathered_kv[:, topk_main:, :] = kv_gathered
+        # Single gather for main scope only
+        gather_dequant_fp8_v32(
+            kv_scope.blocked_k_quantized, indices_main, block_size_main,
+            gathered_kv, invalid_mask, 0, kv_scope.topk_length, s_q)
 
     q_reshaped = q.to(torch.bfloat16).reshape(total_tokens, h_q, d_qk)
 

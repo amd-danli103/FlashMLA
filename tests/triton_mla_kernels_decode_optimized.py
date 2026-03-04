@@ -14,6 +14,8 @@ Optimizations applied:
 Supports:
 - MODEL1 (d_qk=512)
 - V3.2 (d_qk=576)
+
+Note: This implementation assumes KV cache is always FP8 quantized.
 """
 
 import torch
@@ -75,7 +77,10 @@ def _triton_sparse_attn_decode_optimized(
     d_v: int, attn_sink: Optional[torch.Tensor],
     d_qk: int, fused_gather_fn, gather_fn, fused_attn_fn,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized sparse attention decode - unified implementation."""
+    """Optimized sparse attention decode - unified implementation.
+
+    Assumes KV cache is always FP8 quantized (blocked_k_quantized is not None).
+    """
     b, s_q, h_q, _ = q.shape
     total_tokens = b * s_q
     device = q.device
@@ -94,12 +99,12 @@ def _triton_sparse_attn_decode_optimized(
             from triton_mla_kernels_decode_v32 import triton_sparse_attn_decode_v32
             return triton_sparse_attn_decode_v32(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
 
-    # Get quantized KV cache
+    # Get quantized KV cache (always FP8 quantized)
     kv_quantized_main = kv_scope.blocked_k_quantized
     block_size_main = kv_scope.blocked_k.shape[1]
 
-    # Use fused kernel when: no extra scope, quantized KV available, and fused_attn_fn exists
-    if extra_kv_scope is None and kv_quantized_main is not None and fused_attn_fn is not None:
+    # Use fused kernel when: no extra scope and fused_attn_fn exists
+    if extra_kv_scope is None and fused_attn_fn is not None:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
             q_reshaped = q_reshaped.contiguous()
@@ -120,37 +125,26 @@ def _triton_sparse_attn_decode_optimized(
         )
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
-    # Fallback: separate gather + attention
+    # Separate gather + attention path
     gathered_kv = torch.empty(total_tokens, total_topk, d_qk, dtype=torch.bfloat16, device=device)
     invalid_mask = torch.empty(total_tokens, total_topk, dtype=torch.bool, device=device)
     output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
     lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
     indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-    has_extra_quantized = extra_kv_scope is not None and extra_kv_scope.blocked_k_quantized is not None
 
-    if kv_quantized_main is not None and has_extra_quantized:
+    if extra_kv_scope is not None:
+        # Fused gather for both main and extra scope
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra)
         fused_gather_fn(
             kv_quantized_main, indices_main, block_size_main, kv_scope.topk_length,
             extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra, extra_kv_scope.topk_length,
             gathered_kv, invalid_mask, s_q)
-    elif kv_quantized_main is not None:
+    else:
+        # Single gather for main scope only
         gather_fn(kv_quantized_main, indices_main, block_size_main,
                   gathered_kv, invalid_mask, 0, kv_scope.topk_length, s_q)
-        if has_extra_quantized:
-            block_size_extra = extra_kv_scope.blocked_k.shape[1]
-            indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra)
-            gather_fn(extra_kv_scope.blocked_k_quantized, indices_extra, block_size_extra,
-                      gathered_kv, invalid_mask, topk_main, extra_kv_scope.topk_length, s_q)
-    else:
-        if d_qk == MODEL1_D_QK:
-            from triton_mla_kernels_decode_model1 import _triton_sparse_attn_decode_model1_impl
-            return _triton_sparse_attn_decode_model1_impl(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
-        else:
-            from triton_mla_kernels_decode_v32 import _triton_sparse_attn_decode_v32_impl
-            return _triton_sparse_attn_decode_v32_impl(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
 
     # Prepare Q tensor
     if q.dtype == torch.bfloat16 and q.is_contiguous():
