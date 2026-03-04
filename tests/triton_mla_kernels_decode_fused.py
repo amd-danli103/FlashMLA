@@ -390,6 +390,19 @@ def fused_gather_attn_decode_model1(
 # ============================================================================
 # MODEL1 Dual-Scope Fused Gather+Dequant+Attention Kernel
 # ============================================================================
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+    ],
+    key=["total_tokens", "h_q", "topk_main", "topk_extra"],
+)
 @triton.jit
 def _fused_gather_attn_model1_dual_scope_kernel(
     Q,
@@ -859,11 +872,8 @@ def fused_gather_attn_decode_model1_dual_scope(
     topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    # Choose BLOCK_N based on max topk
-    BLOCK_N = _get_block_n(max(topk_main, topk_extra))
-    BLOCK_H = 16
-
-    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
+    # Use lambda grid for autotune (BLOCK_H is determined by autotune)
+    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
 
     _fused_gather_attn_model1_dual_scope_kernel[grid](
         q,
@@ -884,8 +894,6 @@ def fused_gather_attn_decode_model1_dual_scope(
         HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
         HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
         HAS_ATTN_SINK=attn_sink is not None,
-        BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
     )
 
     return output, lse
