@@ -942,9 +942,12 @@ def fused_gather_dequant_fp8_model1(
     # For large workloads, the two-kernel approach is more efficient
     USE_FUSED_THRESHOLD = MODEL1_USE_FUSED_THRESHOLD
 
-    # Now we can use fused kernel even when topk_length settings differ
-    # because we fixed the type mismatch issue by always using int32 tensors
-    use_fused = total_elements < USE_FUSED_THRESHOLD
+    # IMPORTANT: Disable fused kernel when topk_length settings differ between main and extra
+    # The 1D fused kernel has issues with runtime conditional handling when
+    # HAS_TOPK_LENGTH_MAIN != HAS_TOPK_LENGTH_EXTRA, causing incorrect results in extra part.
+    # Only use fused kernel when both have same topk_length setting.
+    topk_length_settings_match = has_topk_length_main == has_topk_length_extra
+    use_fused = total_elements < USE_FUSED_THRESHOLD and topk_length_settings_match
 
     if use_fused:
         return truly_fused_gather_dequant_fp8_model1(
