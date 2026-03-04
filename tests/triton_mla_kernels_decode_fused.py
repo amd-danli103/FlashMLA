@@ -37,6 +37,19 @@ MODEL1_BYTES_PER_TOKEN_SCALE = 8   # 7 scales + 1 padding
 # ============================================================================
 # MODEL1 Fused Gather+Dequant+Attention Kernel
 # ============================================================================
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+    ],
+    key=["total_tokens", "h_q", "topk"],
+)
 @triton.jit
 def _fused_gather_attn_model1_kernel(
     Q, KV_Cache, Indices, TopkLength, AttnSink,
@@ -354,10 +367,9 @@ def fused_gather_attn_decode_model1(
     topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    BLOCK_N = _get_block_n(topk)
-    BLOCK_H = 16
-
-    grid = (total_tokens, triton.cdiv(h_q, BLOCK_H))
+    # Use autotune - grid is computed based on BLOCK_H from autotune
+    def grid(meta):
+        return (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
 
     _fused_gather_attn_model1_kernel[grid](
         q, kv_flat, indices, topk_length_tensor, attn_sink_tensor,
@@ -370,8 +382,6 @@ def fused_gather_attn_decode_model1(
         lse.stride(0), lse.stride(1),
         HAS_TOPK_LENGTH=topk_length is not None,
         HAS_ATTN_SINK=attn_sink is not None,
-        BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
     )
 
     return output, lse

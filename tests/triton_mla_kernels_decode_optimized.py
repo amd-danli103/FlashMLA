@@ -112,8 +112,8 @@ def _triton_sparse_attn_decode_optimized(
     kv_quantized_main = kv_scope.blocked_k_quantized
     block_size_main = kv_scope.blocked_k.shape[1]
 
-    # Use fused kernel for single scope when topk is small
-    if extra_kv_scope is None and fused_attn_fn is not None and topk_main <= FUSED_KERNEL_TOPK_THRESHOLD:
+    # Use fused kernel for single scope (no extra scope)
+    if extra_kv_scope is None and fused_attn_fn is not None:  # No threshold - autotune handles all topk sizes
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
             q_reshaped = q_reshaped.contiguous()
