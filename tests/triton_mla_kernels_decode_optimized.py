@@ -47,9 +47,9 @@ from triton_mla_kernels_decode_fused import (
 )
 
 # Threshold for using fused kernel
-# Fused kernel is efficient when topk is small (reduces kernel launch overhead)
-# For larger topk, separate gather + attention is more efficient due to better parallelism
-FUSED_KERNEL_TOPK_THRESHOLD = 256
+# Fused kernel is efficient when total_tokens is small (reduces kernel launch overhead)
+# For larger total_tokens, separate gather + attention is more efficient due to better parallelism
+FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD = 64  # Only use fused kernel for small batches
 
 
 def triton_sparse_attn_decode(
@@ -134,8 +134,8 @@ def _triton_sparse_attn_decode_optimized(
         )
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
-    # Use fused dual-scope kernel when total topk is small
-    if extra_kv_scope is not None and fused_attn_dual_fn is not None and total_topk <= FUSED_KERNEL_TOPK_THRESHOLD:
+    # Use fused dual-scope kernel when total tokens is small
+    if extra_kv_scope is not None and fused_attn_dual_fn is not None and total_tokens <= FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
             q_reshaped = q_reshaped.contiguous()
