@@ -334,22 +334,29 @@ def _fused_gather_attn_model1_kernel(
     stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
     o_base = Output + pid_t_64 * stride_o_t_64
 
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_tile[None, :] * stride_o_d,
-             acc_0.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_1.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (2*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_2.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (3*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_3.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (4*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_4.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (5*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_5.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (6*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_6.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (7*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_7.to(tl.bfloat16), mask=mask_h[:, None])
+    # Optimized output stores with pre-computed row base pointers
+    # Convert to bfloat16 first (batch conversion)
+    o_0 = acc_0.to(tl.bfloat16)
+    o_1 = acc_1.to(tl.bfloat16)
+    o_2 = acc_2.to(tl.bfloat16)
+    o_3 = acc_3.to(tl.bfloat16)
+    o_4 = acc_4.to(tl.bfloat16)
+    o_5 = acc_5.to(tl.bfloat16)
+    o_6 = acc_6.to(tl.bfloat16)
+    o_7 = acc_7.to(tl.bfloat16)
+
+    # Pre-compute row base pointers (shared across all 8 stores)
+    row_ptrs = o_base + offs_h[:, None] * stride_o_h
+
+    # Store all 8 tiles with optimized pointer arithmetic
+    tl.store(row_ptrs + offs_tile[None, :] * stride_o_d, o_0, mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_1, mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_2, mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_3, mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_4, mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_5, mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_6, mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_7, mask=mask_h[:, None])
 
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
     tl.store(lse_ptrs, lse, mask=mask_h)
@@ -654,22 +661,29 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
     o_base = Output + pid_t_64 * stride_o_t_64
 
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_tile[None, :] * stride_o_d,
-             acc_0.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_1.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (2*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_2.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (3*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_3.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (4*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_4.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (5*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_5.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (6*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_6.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(o_base + offs_h[:, None] * stride_o_h + (7*TILE_SIZE + offs_tile[None, :]) * stride_o_d,
-             acc_7.to(tl.bfloat16), mask=mask_h[:, None])
+    # Optimized output stores with pre-computed row base pointers
+    # Convert to bfloat16 first (batch conversion)
+    o_0 = acc_0.to(tl.bfloat16)
+    o_1 = acc_1.to(tl.bfloat16)
+    o_2 = acc_2.to(tl.bfloat16)
+    o_3 = acc_3.to(tl.bfloat16)
+    o_4 = acc_4.to(tl.bfloat16)
+    o_5 = acc_5.to(tl.bfloat16)
+    o_6 = acc_6.to(tl.bfloat16)
+    o_7 = acc_7.to(tl.bfloat16)
+
+    # Pre-compute row base pointers (shared across all 8 stores)
+    row_ptrs = o_base + offs_h[:, None] * stride_o_h
+
+    # Store all 8 tiles with optimized pointer arithmetic
+    tl.store(row_ptrs + offs_tile[None, :] * stride_o_d, o_0, mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_1, mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_2, mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_3, mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_4, mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_5, mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_6, mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_o_d, o_7, mask=mask_h[:, None])
 
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
     tl.store(lse_ptrs, lse, mask=mask_h)
