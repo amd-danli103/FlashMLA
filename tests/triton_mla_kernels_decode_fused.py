@@ -153,13 +153,11 @@ def _process_kv_block_and_update_acc(
     kv_6 = tl.where(valid_2d, kv_6, 0.0)
     qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
 
-    # Tile 7: rope (BF16)
-    rope_lo_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-    rope_hi_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2 + 1
-    rope_lo = tl.load(rope_lo_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_hi_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-    rope_uint16 = rope_lo | (rope_hi << 8)
-    kv_7 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    # Tile 7: rope (BF16) - optimized: single base pointer
+    rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
+    rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
+    kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
     kv_7 = tl.where(valid_2d, kv_7, 0.0)
     qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
 
