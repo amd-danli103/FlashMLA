@@ -14,6 +14,9 @@ Benefits for workloads without extra scope:
 Supports:
 - MODEL1 (d_qk=512): 7 tiles of 64, uint8 scales
 - All configs: with/without topk_length, with/without attn_sink
+
+OPTIMIZED VERSION: Reduced code duplication in dual-scope kernel by using
+a helper function for KV block processing.
 """
 
 import torch
@@ -35,7 +38,158 @@ MODEL1_BYTES_PER_TOKEN_SCALE = 8   # 7 scales + 1 padding
 
 
 # ============================================================================
-# MODEL1 Fused Gather+Dequant+Attention Kernel
+# Helper: Process KV block and compute QK scores + accumulator update
+# This is the core computation shared by both single and dual scope kernels
+# ============================================================================
+@triton.jit
+def _process_kv_block_and_update_acc(
+    # KV cache parameters
+    kv_block_base,
+    nope_rope_offset,
+    scale_base_offset,
+    valid,
+    valid_2d,
+    # Query tiles
+    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+    # Accumulators (passed by reference via return)
+    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+    # Softmax state
+    m_i, l_i,
+    # Other parameters
+    offs_tile,
+    sm_scale,
+    # Constants
+    TILE_SIZE: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    LOG2E: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Process one block of KV tokens: load, dequantize, compute QK, update accumulators.
+
+    This helper function encapsulates the core computation that is repeated for
+    both MAIN and EXTRA scopes, eliminating code duplication.
+
+    Returns updated accumulators and softmax state.
+    """
+    NEG_INF = float("-inf")
+
+    # Load scales
+    scale_ptrs = kv_block_base + scale_base_offset
+    scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
+    scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
+
+    scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
+    scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+
+    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+
+    qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+
+    # Tile 0: nope (FP8)
+    nope_ptrs = tile_base + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+    kv_0 = tl.where(valid_2d, kv_0, 0.0)
+    qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+
+    # Tile 1: nope (FP8)
+    nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+    kv_1 = tl.where(valid_2d, kv_1, 0.0)
+    qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+
+    # Tile 2: nope (FP8)
+    nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+    kv_2 = tl.where(valid_2d, kv_2, 0.0)
+    qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+
+    # Tile 3: nope (FP8)
+    nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+    kv_3 = tl.where(valid_2d, kv_3, 0.0)
+    qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+
+    # Tile 4: nope (FP8)
+    nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+    kv_4 = tl.where(valid_2d, kv_4, 0.0)
+    qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+
+    # Tile 5: nope (FP8)
+    nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+    kv_5 = tl.where(valid_2d, kv_5, 0.0)
+    qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+
+    # Tile 6: nope (FP8)
+    nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
+    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+    kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+    kv_6 = tl.where(valid_2d, kv_6, 0.0)
+    qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+
+    # Tile 7: rope (BF16)
+    rope_lo_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
+    rope_hi_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2 + 1
+    rope_lo = tl.load(rope_lo_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_hi_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+    rope_uint16 = rope_lo | (rope_hi << 8)
+    kv_7 = rope_uint16.to(tl.bfloat16, bitcast=True)
+    kv_7 = tl.where(valid_2d, kv_7, 0.0)
+    qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
+
+    # Apply softmax scale and mask
+    qk = qk * sm_scale
+    qk = tl.where(valid[None, :], qk, NEG_INF)
+
+    # Online softmax update
+    m_ij = tl.max(qk, axis=1)
+    m_new = tl.maximum(m_i, m_ij)
+    alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
+    p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
+    l_new = alpha * l_i + tl.sum(p, axis=1)
+    p_bf16 = p.to(tl.bfloat16)
+
+    # Update accumulators
+    acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
+    acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
+    acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
+    acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
+    acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
+    acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
+    acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
+    acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
+
+    return acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_new, l_new
+
+
+# ============================================================================
+# MODEL1 Fused Gather+Dequant+Attention Kernel (Single Scope)
 # ============================================================================
 @triton.autotune(
     configs=[
@@ -142,115 +296,24 @@ def _fused_gather_attn_model1_kernel(
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        scale_ptrs = kv_block_base + scale_base_offset
-        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
-
-        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
-
-        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
         valid_2d = valid[:, None]
 
-        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+        # Use helper function for KV processing
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_and_update_acc(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
 
-        # Tiles 0-6: nope (FP8)
-        nope_ptrs = tile_base + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-        kv_0 = tl.where(valid_2d, kv_0, 0.0)
-        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
-
-        nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-        kv_1 = tl.where(valid_2d, kv_1, 0.0)
-        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
-
-        nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-        kv_2 = tl.where(valid_2d, kv_2, 0.0)
-        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
-
-        nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-        kv_3 = tl.where(valid_2d, kv_3, 0.0)
-        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
-
-        nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-        kv_4 = tl.where(valid_2d, kv_4, 0.0)
-        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
-
-        nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-        kv_5 = tl.where(valid_2d, kv_5, 0.0)
-        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
-
-        nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-        kv_6 = tl.where(valid_2d, kv_6, 0.0)
-        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
-
-        # Tile 7: rope (BF16)
-        rope_lo_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-        rope_hi_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2 + 1
-        rope_lo = tl.load(rope_lo_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_hi = tl.load(rope_hi_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_uint16 = rope_lo | (rope_hi << 8)
-        kv_7 = rope_uint16.to(tl.bfloat16, bitcast=True)
-        kv_7 = tl.where(valid_2d, kv_7, 0.0)
-        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
-
-        qk = qk * sm_scale
-        qk = tl.where(valid[None, :], qk, NEG_INF)
-
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
-        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-        l_new = alpha * l_i + tl.sum(p, axis=1)
-        p_bf16 = p.to(tl.bfloat16)
-
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
-
-        m_i = m_new
-        l_i = l_new
-
-    # Compute LSE (before attn_sink adjustment)
+    # Finalize
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = (l_i == 0.0)
 
-    # Compute output scale (matching original kernel logic exactly)
     if HAS_ATTN_SINK:
         attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
         exp_attn_sink_minus_m = tl.math.exp2((attn_sink_vals - m_i) * LOG2E)
@@ -260,7 +323,6 @@ def _fused_gather_attn_model1_kernel(
     else:
         output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
 
-    # Apply output scaling and handle lonely queries
     acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
     acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
     acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
@@ -295,26 +357,21 @@ def _fused_gather_attn_model1_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
-
-
-# ============================================================================
-# Python wrapper functions
-# ============================================================================
 def _get_block_n(topk: int) -> int:
-    """Choose BLOCK_N based on topk."""
+    """Select BLOCK_N based on topk size."""
     if topk <= 64:
-        return 32
-    elif topk <= 128:
         return 64
-    elif topk <= 256:
+    elif topk <= 128:
         return 128
+    elif topk <= 256:
+        return 256
     else:
         return 256
 
 
 def fused_gather_attn_decode_model1(
     q: torch.Tensor,
-    kv_cache_quantized: torch.Tensor,
+    kv_cache: torch.Tensor,
     indices: torch.Tensor,
     block_size: int,
     sm_scale: float,
@@ -323,20 +380,11 @@ def fused_gather_attn_decode_model1(
     s_q: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused gather+dequant+attention for MODEL1 main scope only.
-
-    This kernel is used when:
-    - d_qk=512 (MODEL1)
-    - No extra scope (extra_kv_scope is None)
-    - Quantized KV cache is available
-
-    Supports all configs:
-    - With or without topk_length
-    - With or without attn_sink
+    Fused gather+dequant+attention for MODEL1.
 
     Args:
         q: Query tensor [total_tokens, h_q, d_qk]
-        kv_cache_quantized: Quantized KV cache
+        kv_cache: Quantized KV cache
         indices: KV indices [total_tokens, topk]
         block_size: Block size for KV cache
         sm_scale: Softmax scale
@@ -353,8 +401,8 @@ def fused_gather_attn_decode_model1(
     d_v = MODEL1_D_V
     device = q.device
 
-    kv_uint8 = kv_cache_quantized.view(torch.uint8)
-    num_blocks = kv_cache_quantized.shape[0]
+    kv_uint8 = kv_cache.view(torch.uint8)
+    num_blocks = kv_cache.shape[0]
     stride_kv_block = kv_uint8.stride(0)
     kv_flat = kv_uint8.reshape(num_blocks, -1)
 
@@ -364,12 +412,13 @@ def fused_gather_attn_decode_model1(
     if q.dtype != torch.bfloat16 or not q.is_contiguous():
         q = q.to(torch.bfloat16).contiguous()
 
+    if not indices.is_contiguous():
+        indices = indices.contiguous()
+
     topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    # Use autotune - grid is computed based on BLOCK_H from autotune
-    def grid(meta):
-        return (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
 
     _fused_gather_attn_model1_kernel[grid](
         q, kv_flat, indices, topk_length_tensor, attn_sink_tensor,
@@ -388,7 +437,8 @@ def fused_gather_attn_decode_model1(
 
 
 # ============================================================================
-# MODEL1 Dual-Scope Fused Gather+Dequant+Attention Kernel
+# MODEL1 Dual-Scope Fused Gather+Dequant+Attention Kernel (OPTIMIZED)
+# Uses helper function to eliminate code duplication
 # ============================================================================
 @triton.autotune(
     configs=[
@@ -426,7 +476,19 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Fused gather+dequant+attention kernel for MODEL1 with dual scope."""
+    """
+    OPTIMIZED fused gather+dequant+attention kernel for MODEL1 with dual scope.
+
+    This version uses a helper function (_process_kv_block_and_update_acc) to
+    eliminate the ~200 lines of duplicated code between MAIN and EXTRA scope
+    processing loops.
+
+    The kernel processes:
+    1. MAIN scope: topk_main tokens from KV_Cache_Main
+    2. EXTRA scope: topk_extra tokens from KV_Cache_Extra
+
+    Both scopes contribute to the same online softmax accumulator.
+    """
     LOG2E: tl.constexpr = 1.4426950408889634
     D_NOPE: tl.constexpr = 448
     D_ROPE: tl.constexpr = 64
@@ -462,7 +524,7 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     batch_idx = pid_t // s_q
     offs_tile = tl.arange(0, TILE_SIZE)
 
-    # Load Q tiles
+    # Load Q tiles (shared by both scopes)
     q_0 = tl.load(q_base + offs_h[:, None] * stride_q_h + offs_tile[None, :] * stride_q_d,
                   mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
     q_1 = tl.load(q_base + offs_h[:, None] * stride_q_h + (TILE_SIZE + offs_tile[None, :]) * stride_q_d,
@@ -508,111 +570,19 @@ def _fused_gather_attn_model1_dual_scope_kernel(
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        # Load scales
-        scale_ptrs = kv_block_base + scale_base_offset
-        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
-
-        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
-
-        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
         valid_2d = valid[:, None]
 
-        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-
-        # Tiles 0-6: nope (FP8)
-        nope_ptrs = tile_base + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-        kv_0 = tl.where(valid_2d, kv_0, 0.0)
-        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
-
-        nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-        kv_1 = tl.where(valid_2d, kv_1, 0.0)
-        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
-
-        nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-        kv_2 = tl.where(valid_2d, kv_2, 0.0)
-        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
-
-        nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-        kv_3 = tl.where(valid_2d, kv_3, 0.0)
-        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
-
-        nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-        kv_4 = tl.where(valid_2d, kv_4, 0.0)
-        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
-
-        nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-        kv_5 = tl.where(valid_2d, kv_5, 0.0)
-        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
-
-        nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-        kv_6 = tl.where(valid_2d, kv_6, 0.0)
-        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
-
-        # Tile 7: rope (BF16)
-        rope_lo_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-        rope_hi_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2 + 1
-        rope_lo = tl.load(rope_lo_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_hi = tl.load(rope_hi_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_uint16 = rope_lo | (rope_hi << 8)
-        kv_7 = rope_uint16.to(tl.bfloat16, bitcast=True)
-        kv_7 = tl.where(valid_2d, kv_7, 0.0)
-        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
-
-        qk = qk * sm_scale
-        qk = tl.where(valid[None, :], qk, NEG_INF)
-
-        # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
-        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-        l_new = alpha * l_i + tl.sum(p, axis=1)
-        p_bf16 = p.to(tl.bfloat16)
-
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
-
-        m_i = m_new
-        l_i = l_new
+        # Use helper function for KV processing
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_and_update_acc(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
 
     # ========================================================================
     # Process EXTRA scope
@@ -642,111 +612,19 @@ def _fused_gather_attn_model1_dual_scope_kernel(
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        # Load scales
-        scale_ptrs = kv_block_base + scale_base_offset
-        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
-
-        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
-
-        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
         valid_2d = valid[:, None]
 
-        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-
-        # Tiles 0-6: nope (FP8)
-        nope_ptrs = tile_base + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-        kv_0 = tl.where(valid_2d, kv_0, 0.0)
-        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
-
-        nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-        kv_1 = tl.where(valid_2d, kv_1, 0.0)
-        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
-
-        nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-        kv_2 = tl.where(valid_2d, kv_2, 0.0)
-        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
-
-        nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-        kv_3 = tl.where(valid_2d, kv_3, 0.0)
-        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
-
-        nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-        kv_4 = tl.where(valid_2d, kv_4, 0.0)
-        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
-
-        nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-        kv_5 = tl.where(valid_2d, kv_5, 0.0)
-        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
-
-        nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-        kv_6 = tl.where(valid_2d, kv_6, 0.0)
-        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
-
-        # Tile 7: rope (BF16)
-        rope_lo_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-        rope_hi_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2 + 1
-        rope_lo = tl.load(rope_lo_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_hi = tl.load(rope_hi_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_uint16 = rope_lo | (rope_hi << 8)
-        kv_7 = rope_uint16.to(tl.bfloat16, bitcast=True)
-        kv_7 = tl.where(valid_2d, kv_7, 0.0)
-        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
-
-        qk = qk * sm_scale
-        qk = tl.where(valid[None, :], qk, NEG_INF)
-
-        # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
-        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-        l_new = alpha * l_i + tl.sum(p, axis=1)
-        p_bf16 = p.to(tl.bfloat16)
-
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
-
-        m_i = m_new
-        l_i = l_new
+        # Use helper function for KV processing
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_and_update_acc(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
 
     # ========================================================================
     # Finalize: compute LSE and output
