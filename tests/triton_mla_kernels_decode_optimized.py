@@ -11,6 +11,7 @@ Optimizations applied:
 4. Unified implementation for both MODEL1 and V3.2
 5. Fused gather+dequant+attention for MODEL1 (single and dual scope)
    - Only used when topk is small enough for fused kernel to be efficient
+6. Split-KV optimization for MODEL1 (optional, controlled by USE_SPLITKV)
 
 Supports:
 - MODEL1 (d_qk=512)
@@ -19,6 +20,7 @@ Supports:
 Note: This implementation assumes KV cache is always FP8 quantized.
 """
 
+import os
 import torch
 import triton
 from typing import Optional, Tuple
@@ -46,10 +48,18 @@ from triton_mla_kernels_decode_fused import (
     fused_gather_attn_decode_model1_dual_scope,
 )
 
+from triton_mla_kernels_decode_splitkv import (
+    splitkv_sparse_attn_decode_model1,
+)
+
 # Threshold for using fused kernel
 # Fused kernel is efficient when total_tokens is small (reduces kernel launch overhead)
 # For larger total_tokens, separate gather + attention is more efficient due to better parallelism
 FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD = 64  # Only use fused kernel for small batches
+
+# Environment variable to enable Split-KV optimization
+# Set USE_SPLITKV=1 to enable Split-KV for MODEL1 single-scope cases
+USE_SPLITKV = os.environ.get("USE_SPLITKV", "0") == "1"
 
 
 def triton_sparse_attn_decode(
@@ -112,8 +122,30 @@ def _triton_sparse_attn_decode_optimized(
     kv_quantized_main = kv_scope.blocked_k_quantized
     block_size_main = kv_scope.blocked_k.shape[1]
 
+    # Use Split-KV for MODEL1 single scope when enabled
+    if USE_SPLITKV and d_qk == MODEL1_D_QK and extra_kv_scope is None:
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
+        if not q_reshaped.is_contiguous():
+            q_reshaped = q_reshaped.contiguous()
+
+        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
+        if not indices_main.is_contiguous():
+            indices_main = indices_main.contiguous()
+
+        output, lse = splitkv_sparse_attn_decode_model1(
+            q_reshaped,
+            kv_quantized_main,
+            indices_main,
+            block_size_main,
+            sm_scale,
+            topk_length=kv_scope.topk_length,
+            attn_sink=attn_sink,
+            s_q=s_q,
+        )
+        return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
+
     # Use fused kernel for single scope (no extra scope)
-    if extra_kv_scope is None and fused_attn_fn is not None:  # No threshold - autotune handles all topk sizes
+    if extra_kv_scope is None and fused_attn_fn is not None:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
             q_reshaped = q_reshaped.contiguous()
