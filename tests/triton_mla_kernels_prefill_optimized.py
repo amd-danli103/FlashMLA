@@ -1,12 +1,13 @@
 """
 Optimized Triton implementation of MLA sparse attention prefill kernel.
 
-Version: v22
+Version: v23
 
 Key Optimizations:
 1. Direct stride usage for non-contiguous tensors - avoids contiguous() calls (~350us saved)
 2. Dual output (bf16 + fp32) in kernel - avoids type conversion overhead (~280us saved)
 3. Optimal block configuration: BLOCK_M=64, BLOCK_N=128, BLOCK_D=128, warps=4, stages=1
+4. Fixed int64 casting for large s_q values to prevent integer overflow
 
 Performance Results:
 - CONFIG1 (h_q=64, topk=512): ~1140us, 6.8x speedup vs reference
@@ -70,8 +71,8 @@ def _sparse_attn_fwd_kernel(
     LOG2E: tl.constexpr = 1.4426950408889634
     NEG_INF: tl.constexpr = float("-inf")
 
-    # Get program IDs
-    pid_sq = tl.program_id(0)
+    # Get program IDs and cast to int64 to prevent overflow in pointer arithmetic
+    pid_sq = tl.program_id(0).to(tl.int64)
     pid_m = tl.program_id(1)
 
     # Early exit for out-of-bounds blocks
@@ -82,7 +83,7 @@ def _sparse_attn_fwd_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < h_q
 
-    # Base pointers for this query position
+    # Base pointers for this query position (use int64 for large offset calculations)
     q_base = Q + pid_sq * stride_q_sq
     idx_base = Indices + pid_sq * stride_idx_sq
 
@@ -103,7 +104,7 @@ def _sparse_attn_fwd_kernel(
         raw_idx = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
         valid = mask_n & (raw_idx >= 0) & (raw_idx < s_kv)
-        kv_idx = tl.where(valid, raw_idx, 0)
+        kv_idx = tl.where(valid, raw_idx, 0).to(tl.int64)
         kv_row_base = kv_idx * stride_kv_skv
 
         # Compute Q @ K^T in chunks along d_qk dimension
@@ -149,7 +150,7 @@ def _sparse_attn_fwd_kernel(
         m_i = m_new
         l_i = l_new
 
-    # Store max logits
+    # Store max logits (use int64 for pid_sq multiplication)
     ml_ptrs = MaxLogits + pid_sq * stride_ml_sq + offs_m * stride_ml_hq
     tl.store(ml_ptrs, m_i, mask=mask_m)
 
@@ -197,12 +198,12 @@ def _sparse_attn_fwd_kernel(
     scale = tl.where(has_valid, tl.math.exp2((m_i - lse_for_o_safe) * LOG2E), 0.0)
     acc = acc * scale[:, None]
 
-    # Store LSE
+    # Store LSE (use int64 for pid_sq multiplication)
     final_lse = tl.where(orig_lse == NEG_INF, float("+inf"), orig_lse)
     lse_ptrs = LSE + pid_sq * stride_lse_sq + offs_m * stride_lse_hq
     tl.store(lse_ptrs, final_lse, mask=mask_m)
 
-    # Store outputs in both bf16 and fp32 formats
+    # Store outputs in both bf16 and fp32 formats (use int64 for pid_sq multiplication)
     out_bf16_ptrs = Out_BF16 + pid_sq * stride_o_bf16_sq + offs_m[:, None] * stride_o_bf16_hq + offs_dv[None, :] * stride_o_bf16_d
     out_fp32_ptrs = Out_FP32 + pid_sq * stride_o_fp32_sq + offs_m[:, None] * stride_o_fp32_hq + offs_dv[None, :] * stride_o_fp32_d
 

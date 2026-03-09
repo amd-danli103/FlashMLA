@@ -149,9 +149,9 @@ if __name__ == '__main__':
         for s_q in [1, 1024]
     ] + [
         # In this testcase, s_q is really large, so we cannot put it on the second dimension of grid shape
-        # Note: Using s_q=8192 instead of 70000 for optimized kernel due to memory constraints
-        # (70000 * 128 * 512 * 6 bytes for dual output = ~27GB which exceeds GPU memory)
-        TestParam(8192, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
+        # Test with large s_q to verify int64 pointer arithmetic works correctly
+        # This tests the fix for integer overflow in pointer calculations
+        TestParam(70000, 256, 256, h_q=h_q, check_correctness=False, num_runs=0, have_attn_sink=True, have_topk_length=True, d_qk=d_qk)
         for d_qk in [512, 576]
         for h_q in [
             128, 64
