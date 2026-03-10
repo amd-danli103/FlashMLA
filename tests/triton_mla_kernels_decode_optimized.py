@@ -108,21 +108,12 @@ def _triton_sparse_attn_decode_optimized(
     topk_extra = extra_kv_scope.indices_in_kvcache.size(-1) if extra_kv_scope is not None else 0
     total_topk = topk_main + topk_extra
 
-    # Check if chunking needed (rare for small workloads)
-    token_ranges = compute_token_ranges(total_tokens, total_topk, d_qk)
-    if len(token_ranges) > 1:
-        if d_qk == MODEL1_D_QK:
-            from triton_mla_kernels_decode_model1 import triton_sparse_attn_decode_model1
-            return triton_sparse_attn_decode_model1(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
-        else:
-            from triton_mla_kernels_decode_v32 import triton_sparse_attn_decode_v32
-            return triton_sparse_attn_decode_v32(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
-
     # Get quantized KV cache (always FP8 quantized)
     kv_quantized_main = kv_scope.blocked_k_quantized
     block_size_main = kv_scope.blocked_k.shape[1]
 
     # Use Split-KV for MODEL1 single scope when enabled
+    # Check this BEFORE token chunking to handle large topk cases
     if USE_SPLITKV and d_qk == MODEL1_D_QK and extra_kv_scope is None:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
@@ -143,6 +134,16 @@ def _triton_sparse_attn_decode_optimized(
             s_q=s_q,
         )
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
+
+    # Check if chunking needed (rare for small workloads)
+    token_ranges = compute_token_ranges(total_tokens, total_topk, d_qk)
+    if len(token_ranges) > 1:
+        if d_qk == MODEL1_D_QK:
+            from triton_mla_kernels_decode_model1 import triton_sparse_attn_decode_model1
+            return triton_sparse_attn_decode_model1(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
+        else:
+            from triton_mla_kernels_decode_v32 import triton_sparse_attn_decode_v32
+            return triton_sparse_attn_decode_v32(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
 
     # Use fused kernel for single scope (no extra scope)
     if extra_kv_scope is None and fused_attn_fn is not None:
