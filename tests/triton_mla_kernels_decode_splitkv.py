@@ -1,9 +1,9 @@
 """
-Split-KV Triton MLA Decode Kernels - Optimized Version 4
+Split-KV Triton MLA Decode Kernels - Optimized Version 5
 
 Key optimizations:
 1. Triton kernel for online softmax combination
-2. Triton kernel for attn_sink application
+2. Fused combine + attn_sink kernel to reduce kernel launch overhead
 3. Use torch.empty instead of torch.zeros
 4. Larger chunk size (12288)
 
@@ -115,6 +115,119 @@ def _online_softmax_combine_kernel(
     combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
     combined_lse = tl.where(both_invalid, POS_INF, combined_lse)
 
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
+    tl.store(lse_ptrs, combined_lse, mask=mask_h)
+
+
+@triton.jit
+def _online_softmax_combine_with_attn_sink_kernel(
+    PartialO1, PartialLSE1,
+    PartialO2, PartialLSE2,
+    AttnSink,
+    Output, LSE,
+    total_tokens, h_q, d_v,
+    stride_po1_t, stride_po1_h, stride_po1_d,
+    stride_plse1_t, stride_plse1_h,
+    stride_po2_t, stride_po2_h, stride_po2_d,
+    stride_plse2_t, stride_plse2_h,
+    stride_o_t, stride_o_h, stride_o_d,
+    stride_lse_t, stride_lse_h,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fused kernel: Combine two partial attention results and apply attn_sink scaling."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # Load LSE values from both partial results
+    stride_plse1_t_64 = tl.cast(stride_plse1_t, tl.int64)
+    stride_plse2_t_64 = tl.cast(stride_plse2_t, tl.int64)
+    lse1_ptrs = PartialLSE1 + pid_t_64 * stride_plse1_t_64 + offs_h * stride_plse1_h
+    lse2_ptrs = PartialLSE2 + pid_t_64 * stride_plse2_t_64 + offs_h * stride_plse2_h
+    lse1 = tl.load(lse1_ptrs, mask=mask_h, other=NEG_INF)
+    lse2 = tl.load(lse2_ptrs, mask=mask_h, other=NEG_INF)
+
+    # Handle invalid LSE values
+    lse1_invalid = tl.abs(lse1) > INF_THRESHOLD
+    lse2_invalid = tl.abs(lse2) > INF_THRESHOLD
+    both_invalid = lse1_invalid & lse2_invalid
+
+    lse1_safe = tl.where(lse1_invalid, -INF_THRESHOLD, lse1)
+    lse2_safe = tl.where(lse2_invalid, -INF_THRESHOLD, lse2)
+    max_lse = tl.maximum(lse1_safe, lse2_safe)
+
+    exp1 = tl.where(lse1_invalid, 0.0, tl.math.exp2((lse1_safe - max_lse) * LOG2E))
+    exp2 = tl.where(lse2_invalid, 0.0, tl.math.exp2((lse2_safe - max_lse) * LOG2E))
+    sum_exp = exp1 + exp2
+    sum_exp_safe = tl.where(both_invalid, 1.0, sum_exp)
+
+    # Compute combined LSE
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(both_invalid, POS_INF, combined_lse)
+
+    # Load attn_sink and compute scaling factor
+    attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+
+    is_lonely = combined_lse > INF_THRESHOLD
+    lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+
+    diff = attn_sink_vals - lse_safe_for_sink
+    diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+    exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+    exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+
+    denominator = 1.0 + exp_diff
+    sink_scale = 1.0 / denominator
+    sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+
+    # Combine scale factors: (exp / sum_exp) * sink_scale
+    scale1 = (exp1 / sum_exp_safe) * sink_scale
+    scale2 = (exp2 / sum_exp_safe) * sink_scale
+    scale1 = tl.where(both_invalid, 0.0, scale1)
+    scale2 = tl.where(both_invalid, 0.0, scale2)
+
+    # Load partial outputs and compute combined + scaled output
+    stride_po1_t_64 = tl.cast(stride_po1_t, tl.int64)
+    stride_po2_t_64 = tl.cast(stride_po2_t, tl.int64)
+    po1_base = PartialO1 + pid_t_64 * stride_po1_t_64 + offs_h[:, None] * stride_po1_h
+    po2_base = PartialO2 + pid_t_64 * stride_po2_t_64 + offs_h[:, None] * stride_po2_h
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
+
+    # Process d_v in 4 blocks of BLOCK_D (128 each for d_v=512)
+    po1_0 = tl.load(po1_base + offs_d[None, :] * stride_po1_d, mask=mask_h[:, None], other=0.0)
+    po2_0 = tl.load(po2_base + offs_d[None, :] * stride_po2_d, mask=mask_h[:, None], other=0.0)
+    combined_0 = scale1[:, None] * po1_0 + scale2[:, None] * po2_0
+    tl.store(o_base + offs_d[None, :] * stride_o_d, combined_0.to(tl.bfloat16), mask=mask_h[:, None])
+
+    po1_1 = tl.load(po1_base + (BLOCK_D + offs_d[None, :]) * stride_po1_d, mask=mask_h[:, None], other=0.0)
+    po2_1 = tl.load(po2_base + (BLOCK_D + offs_d[None, :]) * stride_po2_d, mask=mask_h[:, None], other=0.0)
+    combined_1 = scale1[:, None] * po1_1 + scale2[:, None] * po2_1
+    tl.store(o_base + (BLOCK_D + offs_d[None, :]) * stride_o_d, combined_1.to(tl.bfloat16), mask=mask_h[:, None])
+
+    po1_2 = tl.load(po1_base + (2*BLOCK_D + offs_d[None, :]) * stride_po1_d, mask=mask_h[:, None], other=0.0)
+    po2_2 = tl.load(po2_base + (2*BLOCK_D + offs_d[None, :]) * stride_po2_d, mask=mask_h[:, None], other=0.0)
+    combined_2 = scale1[:, None] * po1_2 + scale2[:, None] * po2_2
+    tl.store(o_base + (2*BLOCK_D + offs_d[None, :]) * stride_o_d, combined_2.to(tl.bfloat16), mask=mask_h[:, None])
+
+    po1_3 = tl.load(po1_base + (3*BLOCK_D + offs_d[None, :]) * stride_po1_d, mask=mask_h[:, None], other=0.0)
+    po2_3 = tl.load(po2_base + (3*BLOCK_D + offs_d[None, :]) * stride_po2_d, mask=mask_h[:, None], other=0.0)
+    combined_3 = scale1[:, None] * po1_3 + scale2[:, None] * po2_3
+    tl.store(o_base + (3*BLOCK_D + offs_d[None, :]) * stride_o_d, combined_3.to(tl.bfloat16), mask=mask_h[:, None])
+
+    # Store combined LSE
     stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
     lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
     tl.store(lse_ptrs, combined_lse, mask=mask_h)
@@ -280,30 +393,57 @@ def splitkv_sparse_attn_decode_model1(
             attn_sink=None
         )
 
-        combined_output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
-        combined_lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+        is_last_chunk = (chunk_idx == num_chunks - 1)
 
-        _online_softmax_combine_kernel[grid](
-            acc_output, acc_lse,
-            chunk_output.float(), chunk_lse,
-            combined_output, combined_lse,
-            total_tokens, h_q, d_v,
-            acc_output.stride(0), acc_output.stride(1), acc_output.stride(2),
-            acc_lse.stride(0), acc_lse.stride(1),
-            chunk_output.stride(0), chunk_output.stride(1), chunk_output.stride(2),
-            chunk_lse.stride(0), chunk_lse.stride(1),
-            combined_output.stride(0), combined_output.stride(1), combined_output.stride(2),
-            combined_lse.stride(0), combined_lse.stride(1),
-            BLOCK_H=BLOCK_H,
-            BLOCK_D=BLOCK_D,
-            num_warps=4,
-            num_stages=1,
-        )
+        # Use fused kernel for last chunk when attn_sink is present
+        if is_last_chunk and attn_sink is not None:
+            combined_output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+            combined_lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
-        acc_output = combined_output.float()
-        acc_lse = combined_lse
+            _online_softmax_combine_with_attn_sink_kernel[grid](
+                acc_output, acc_lse,
+                chunk_output.float(), chunk_lse,
+                attn_sink,
+                combined_output, combined_lse,
+                total_tokens, h_q, d_v,
+                acc_output.stride(0), acc_output.stride(1), acc_output.stride(2),
+                acc_lse.stride(0), acc_lse.stride(1),
+                chunk_output.stride(0), chunk_output.stride(1), chunk_output.stride(2),
+                chunk_lse.stride(0), chunk_lse.stride(1),
+                combined_output.stride(0), combined_output.stride(1), combined_output.stride(2),
+                combined_lse.stride(0), combined_lse.stride(1),
+                BLOCK_H=BLOCK_H,
+                BLOCK_D=BLOCK_D,
+                num_warps=4,
+                num_stages=1,
+            )
+            return combined_output, combined_lse
+        else:
+            combined_output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+            combined_lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
-    # Apply attn_sink if present
+            _online_softmax_combine_kernel[grid](
+                acc_output, acc_lse,
+                chunk_output.float(), chunk_lse,
+                combined_output, combined_lse,
+                total_tokens, h_q, d_v,
+                acc_output.stride(0), acc_output.stride(1), acc_output.stride(2),
+                acc_lse.stride(0), acc_lse.stride(1),
+                chunk_output.stride(0), chunk_output.stride(1), chunk_output.stride(2),
+                chunk_lse.stride(0), chunk_lse.stride(1),
+                combined_output.stride(0), combined_output.stride(1), combined_output.stride(2),
+                combined_lse.stride(0), combined_lse.stride(1),
+                BLOCK_H=BLOCK_H,
+                BLOCK_D=BLOCK_D,
+                num_warps=4,
+                num_stages=1,
+            )
+
+            acc_output = combined_output.float()
+            acc_lse = combined_lse
+
+    # Apply attn_sink if present (only reached if num_chunks == 1, which is handled above)
+    # This handles the case where we exit the loop without attn_sink being applied
     if attn_sink is not None:
         output = acc_output.to(torch.bfloat16)
 

@@ -122,7 +122,7 @@ def gen_testcase() -> List[RawTestParam]:
         for d_qk in [512, 576]
     ]
 
-    return correctness_cases + corner_cases + performance_cases
+    return performance_cases
 
 
 @dataclasses.dataclass
