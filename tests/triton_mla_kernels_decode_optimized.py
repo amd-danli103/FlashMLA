@@ -28,7 +28,6 @@ from typing import Optional, Tuple
 from triton_mla_kernels_decode_common import (
     compute_token_ranges,
     _unified_sparse_decode_kernel,
-    _unified_sparse_decode_kernel_fixed,
 )
 
 from triton_mla_kernels_decode_model1 import (
@@ -236,33 +235,17 @@ def _triton_sparse_attn_decode_optimized(
     HAS_ATTN_SINK = attn_sink is not None
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
-    if total_tokens * h_q < 1024 and total_topk <= 1024:
-        grid = (total_tokens, triton.cdiv(h_q, 16))
-        _unified_sparse_decode_kernel_fixed[grid](
-            q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
-            output, lse,
-            sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
-            stride_q_t, stride_q_h, stride_q_d,
-            stride_kv_t, stride_kv_k, stride_kv_d,
-            stride_mask_t, stride_mask_k,
-            stride_o_t, stride_o_h, stride_o_d,
-            stride_lse_t, stride_lse_h,
-            HAS_ATTN_SINK=HAS_ATTN_SINK,
-            BLOCK_H=16, BLOCK_N=64, BLOCK_D=128,
-            num_warps=4, num_stages=1,
-        )
-    else:
-        grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
-        _unified_sparse_decode_kernel[grid](
-            q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
-            output, lse,
-            sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
-            stride_q_t, stride_q_h, stride_q_d,
-            stride_kv_t, stride_kv_k, stride_kv_d,
-            stride_mask_t, stride_mask_k,
-            stride_o_t, stride_o_h, stride_o_d,
-            stride_lse_t, stride_lse_h,
-            HAS_ATTN_SINK=HAS_ATTN_SINK,
-        )
+    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    _unified_sparse_decode_kernel[grid](
+        q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
+        output, lse,
+        sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
+        stride_q_t, stride_q_h, stride_q_d,
+        stride_kv_t, stride_kv_k, stride_kv_d,
+        stride_mask_t, stride_mask_k,
+        stride_o_t, stride_o_h, stride_o_d,
+        stride_lse_t, stride_lse_h,
+        HAS_ATTN_SINK=HAS_ATTN_SINK,
+    )
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
