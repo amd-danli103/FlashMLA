@@ -290,7 +290,8 @@ def _fused_gather_attn_model1_kernel(
         block_idx_64 = block_idx.to(tl.int64)
         offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache + block_idx_64 * stride_kv_block
+        stride_kv_block_64 = tl.cast(stride_kv_block, tl.int64)
+        kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
@@ -374,6 +375,12 @@ def _get_block_n(topk: int) -> int:
         return 256
 
 
+# Threshold for disabling AMD buffer_ops optimization
+# When KV cache size exceeds INT32_MAX, buffer_ops can cause int32 overflow
+# INT32_MAX = 2^31 - 1 = 2,147,483,647 bytes (~2GB)
+BUFFER_OPS_DISABLE_THRESHOLD = 2 * 1024 * 1024 * 1024  # 2GB
+
+
 def fused_gather_attn_decode_model1(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -407,6 +414,7 @@ def fused_gather_attn_decode_model1(
     device = q.device
 
     kv_uint8 = kv_cache.view(torch.uint8)
+    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks = kv_cache.shape[0]
     stride_kv_block = kv_uint8.stride(0)
     kv_flat = kv_uint8.reshape(num_blocks, -1)
@@ -425,18 +433,32 @@ def fused_gather_attn_decode_model1(
 
     grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
 
-    _fused_gather_attn_model1_kernel[grid](
-        q, kv_flat, indices, topk_length_tensor, attn_sink_tensor,
-        output, lse,
-        sm_scale, total_tokens, h_q, topk, num_blocks, block_size, s_q,
-        q.stride(0), q.stride(1), q.stride(2),
-        stride_kv_block,
-        indices.stride(0), indices.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        lse.stride(0), lse.stride(1),
-        HAS_TOPK_LENGTH=topk_length is not None,
-        HAS_ATTN_SINK=attn_sink is not None,
-    )
+    # Check if KV cache size exceeds threshold for buffer_ops
+    # When stride * num_blocks > INT32_MAX, AMD buffer_ops can overflow
+    kv_cache_size = stride_kv_block * num_blocks
+    disable_buffer_ops = kv_cache_size > BUFFER_OPS_DISABLE_THRESHOLD
+
+    def run_kernel():
+        _fused_gather_attn_model1_kernel[grid](
+            q, kv_flat, indices, topk_length_tensor, attn_sink_tensor,
+            output, lse,
+            sm_scale, total_tokens, h_q, topk, num_blocks, block_size, s_q,
+            q.stride(0), q.stride(1), q.stride(2),
+            stride_kv_block,
+            indices.stride(0), indices.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            lse.stride(0), lse.stride(1),
+            HAS_TOPK_LENGTH=topk_length is not None,
+            HAS_ATTN_SINK=attn_sink is not None,
+        )
+
+    if disable_buffer_ops:
+        # Disable AMD buffer_ops to avoid int32 overflow with large KV cache
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_buffer_ops = False
+            run_kernel()
+    else:
+        run_kernel()
 
     return output, lse
 
@@ -571,7 +593,8 @@ def _fused_gather_attn_model1_dual_scope_kernel(
         block_idx_64 = block_idx.to(tl.int64)
         offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main
+        stride_kv_block_main_64 = tl.cast(stride_kv_block_main, tl.int64)
+        kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
@@ -613,7 +636,8 @@ def _fused_gather_attn_model1_dual_scope_kernel(
         block_idx_64 = block_idx.to(tl.int64)
         offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra
+        stride_kv_block_extra_64 = tl.cast(stride_kv_block_extra, tl.int64)
+        kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
         nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
         scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
@@ -735,12 +759,14 @@ def fused_gather_attn_decode_model1_dual_scope(
 
     # Prepare main KV cache
     kv_uint8_main = kv_cache_main.view(torch.uint8)
+    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks_main = kv_cache_main.shape[0]
     stride_kv_block_main = kv_uint8_main.stride(0)
     kv_flat_main = kv_uint8_main.reshape(num_blocks_main, -1)
 
     # Prepare extra KV cache
     kv_uint8_extra = kv_cache_extra.view(torch.uint8)
+    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks_extra = kv_cache_extra.shape[0]
     stride_kv_block_extra = kv_uint8_extra.stride(0)
     kv_flat_extra = kv_uint8_extra.reshape(num_blocks_extra, -1)
@@ -765,25 +791,40 @@ def fused_gather_attn_decode_model1_dual_scope(
     # Use lambda grid for autotune (BLOCK_H is determined by autotune)
     grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
 
-    _fused_gather_attn_model1_dual_scope_kernel[grid](
-        q,
-        kv_flat_main, indices_main, topk_length_main_tensor,
-        kv_flat_extra, indices_extra, topk_length_extra_tensor,
-        attn_sink_tensor,
-        output, lse,
-        sm_scale, total_tokens, h_q,
-        topk_main, num_blocks_main, block_size_main,
-        topk_extra, num_blocks_extra, block_size_extra,
-        s_q,
-        q.stride(0), q.stride(1), q.stride(2),
-        stride_kv_block_main, stride_kv_block_extra,
-        indices_main.stride(0), indices_main.stride(1),
-        indices_extra.stride(0), indices_extra.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        lse.stride(0), lse.stride(1),
-        HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
-        HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
-        HAS_ATTN_SINK=attn_sink is not None,
-    )
+    # Check if either KV cache size exceeds threshold for buffer_ops
+    kv_cache_size_main = stride_kv_block_main * num_blocks_main
+    kv_cache_size_extra = stride_kv_block_extra * num_blocks_extra
+    disable_buffer_ops = (kv_cache_size_main > BUFFER_OPS_DISABLE_THRESHOLD or
+                          kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD)
+
+    def run_kernel():
+        _fused_gather_attn_model1_dual_scope_kernel[grid](
+            q,
+            kv_flat_main, indices_main, topk_length_main_tensor,
+            kv_flat_extra, indices_extra, topk_length_extra_tensor,
+            attn_sink_tensor,
+            output, lse,
+            sm_scale, total_tokens, h_q,
+            topk_main, num_blocks_main, block_size_main,
+            topk_extra, num_blocks_extra, block_size_extra,
+            s_q,
+            q.stride(0), q.stride(1), q.stride(2),
+            stride_kv_block_main, stride_kv_block_extra,
+            indices_main.stride(0), indices_main.stride(1),
+            indices_extra.stride(0), indices_extra.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            lse.stride(0), lse.stride(1),
+            HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
+            HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
+            HAS_ATTN_SINK=attn_sink is not None,
+        )
+
+    if disable_buffer_ops:
+        # Disable AMD buffer_ops to avoid int32 overflow with large KV cache
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_buffer_ops = False
+            run_kernel()
+    else:
+        run_kernel()
 
     return output, lse

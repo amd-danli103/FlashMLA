@@ -10,8 +10,9 @@ Optimizations applied:
 3. Avoided redundant tensor operations
 4. Unified implementation for both MODEL1 and V3.2
 5. Fused gather+dequant+attention for MODEL1 (single and dual scope)
-   - Only used when topk is small enough for fused kernel to be efficient
-6. Split-KV optimization for MODEL1 (optional, controlled by USE_SPLITKV)
+   - All single scope cases use fused kernel path
+   - Dual scope cases use fused dual-scope kernel or separate gather + attention
+6. Split-KV optimization for MODEL1 (optional, controlled by USE_SPLITKV env var)
 
 Supports:
 - MODEL1 (d_qk=512)
@@ -58,6 +59,7 @@ FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD = 64  # Only use fused kernel for small batc
 
 # Environment variable to enable Split-KV optimization
 # Set USE_SPLITKV=1 to enable Split-KV for MODEL1 single-scope cases
+# This is an alternative optimization path that may be useful for certain workloads
 USE_SPLITKV = os.environ.get("USE_SPLITKV", "0") == "1"
 
 
@@ -111,8 +113,31 @@ def _triton_sparse_attn_decode_optimized(
     kv_quantized_main = kv_scope.blocked_k_quantized
     block_size_main = kv_scope.blocked_k.shape[1]
 
-    # Use Split-KV for MODEL1 single scope when enabled
-    # Check this BEFORE token chunking to handle large topk cases
+    # Use fused kernel for all single scope cases (no extra scope)
+    # Note: AMD buffer_ops is disabled in fused kernel to avoid int32 overflow with large KV cache
+    if extra_kv_scope is None and fused_attn_fn is not None:
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
+        if not q_reshaped.is_contiguous():
+            q_reshaped = q_reshaped.contiguous()
+
+        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
+        if not indices_main.is_contiguous():
+            indices_main = indices_main.contiguous()
+
+        output, lse = fused_attn_fn(
+            q_reshaped,
+            kv_quantized_main,
+            indices_main,
+            block_size_main,
+            sm_scale,
+            topk_length=kv_scope.topk_length,
+            attn_sink=attn_sink,
+            s_q=s_q,
+        )
+        return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
+
+    # Use Split-KV for MODEL1 single scope when enabled via environment variable
+    # This is an alternative optimization path (currently fused kernel is preferred)
     if USE_SPLITKV and d_qk == MODEL1_D_QK and extra_kv_scope is None:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
@@ -134,7 +159,7 @@ def _triton_sparse_attn_decode_optimized(
         )
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
-    # Check if chunking needed (rare for small workloads)
+    # Check if chunking needed (for non-fused paths with large buffer requirements)
     token_ranges = compute_token_ranges(total_tokens, total_topk, d_qk)
     if len(token_ranges) > 1:
         if d_qk == MODEL1_D_QK:
@@ -143,28 +168,6 @@ def _triton_sparse_attn_decode_optimized(
         else:
             from triton_mla_kernels_decode_v32 import triton_sparse_attn_decode_v32
             return triton_sparse_attn_decode_v32(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
-
-    # Use fused kernel for single scope (no extra scope)
-    if extra_kv_scope is None and fused_attn_fn is not None:
-        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
-        if not q_reshaped.is_contiguous():
-            q_reshaped = q_reshaped.contiguous()
-
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-        if not indices_main.is_contiguous():
-            indices_main = indices_main.contiguous()
-
-        output, lse = fused_attn_fn(
-            q_reshaped,
-            kv_quantized_main,
-            indices_main,
-            block_size_main,
-            sm_scale,
-            topk_length=kv_scope.topk_length,
-            attn_sink=attn_sink,
-            s_q=s_q,
-        )
-        return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
     # Use fused dual-scope kernel when total tokens is small
     if extra_kv_scope is not None and fused_attn_dual_fn is not None and total_tokens <= FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD:
@@ -197,7 +200,7 @@ def _triton_sparse_attn_decode_optimized(
         )
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
-    # Fallback: Separate gather + attention path (more efficient for large topk)
+    # Fallback: Separate gather + attention path (more efficient for large topk/KV cache)
     gathered_kv = torch.empty(total_tokens, total_topk, d_qk, dtype=torch.bfloat16, device=device)
     invalid_mask = torch.empty(total_tokens, total_topk, dtype=torch.bool, device=device)
     output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
