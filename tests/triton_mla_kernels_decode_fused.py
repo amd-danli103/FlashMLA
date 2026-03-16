@@ -477,14 +477,21 @@ def fused_gather_attn_decode_model1(
 # ============================================================================
 @triton.autotune(
     configs=[
+        # Configs optimized for small batch (total_tokens <= 64)
+        # Smaller BLOCK_H for better parallelism with few tokens
+        # Larger BLOCK_N to reduce loop iterations
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        # For h_q=128 case, allow BLOCK_H=128 but with smaller warps
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens", "h_q", "topk_main", "topk_extra"],
 )
@@ -531,8 +538,9 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     BYTES_PER_TOKEN_DATA: tl.constexpr = 576
     BYTES_PER_TOKEN_SCALE: tl.constexpr = 8
 
-    pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    # OPTIMIZED: Swapped grid - pid_h first for better cache locality
+    pid_h = tl.program_id(0)
+    pid_t = tl.program_id(1)
     pid_t_64 = pid_t.to(tl.int64)
 
     NEG_INF = float("-inf")
@@ -797,7 +805,8 @@ def fused_gather_attn_decode_model1_dual_scope(
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
     # Use lambda grid for autotune (BLOCK_H is determined by autotune)
-    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    # OPTIMIZED: Swapped grid - (num_h_blocks, total_tokens) for better cache locality
+    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
 
     # Check if either KV cache size exceeds threshold for buffer_ops
     kv_cache_size_main = stride_kv_block_main * num_blocks_main
