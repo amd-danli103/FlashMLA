@@ -400,6 +400,7 @@ def fused_gather_attn_decode_model1(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused gather+dequant+attention for MODEL1.
+    Uses Split-K optimization for large topk (>= 8192).
 
     Args:
         q: Query tensor [total_tokens, h_q, d_qk]
@@ -421,13 +422,9 @@ def fused_gather_attn_decode_model1(
     device = q.device
 
     kv_uint8 = kv_cache.view(torch.uint8)
-    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks = kv_cache.shape[0]
     stride_kv_block = kv_uint8.stride(0)
     kv_flat = kv_uint8.reshape(num_blocks, -1)
-
-    output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
-    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
     if q.dtype != torch.bfloat16 or not q.is_contiguous():
         q = q.to(torch.bfloat16).contiguous()
@@ -435,16 +432,81 @@ def fused_gather_attn_decode_model1(
     if not indices.is_contiguous():
         indices = indices.contiguous()
 
+    kv_cache_size = stride_kv_block * num_blocks
+    disable_buffer_ops = kv_cache_size > BUFFER_OPS_DISABLE_THRESHOLD
+
+    # Use Split-K for large topk
+    if topk >= SPLITK_TOPK_THRESHOLD:
+        split_k = SPLITK_DEFAULT
+        topk_per_split = (topk + split_k - 1) // split_k
+
+        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
+        output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+
+        topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
+        attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
+
+        BLOCK_H = 64
+        BLOCK_N = 128
+
+        grid_splitk = (triton.cdiv(h_q, BLOCK_H), total_tokens, split_k)
+
+        def run_splitk_kernel():
+            _fused_gather_attn_model1_splitk_kernel[grid_splitk](
+                q, kv_flat, indices, topk_length_tensor,
+                partial_output, partial_lse,
+                sm_scale, total_tokens, h_q, topk, num_blocks, block_size, s_q,
+                topk_per_split,
+                q.stride(0), q.stride(1), q.stride(2),
+                stride_kv_block,
+                indices.stride(0), indices.stride(1),
+                partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+                partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+                HAS_TOPK_LENGTH=topk_length is not None,
+                BLOCK_H=BLOCK_H,
+                BLOCK_N=BLOCK_N,
+                num_warps=4,
+                num_stages=1,
+            )
+
+        if disable_buffer_ops:
+            with triton.knobs.amd.scope():
+                triton.knobs.amd.use_buffer_ops = False
+                run_splitk_kernel()
+        else:
+            run_splitk_kernel()
+
+        BLOCK_H_COMBINE = 16
+        BLOCK_D_COMBINE = 128
+        grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
+
+        _combine_splitk_kernel[grid_combine](
+            partial_output, partial_lse, attn_sink_tensor,
+            output, lse,
+            total_tokens, h_q, d_v,
+            partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+            partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            lse.stride(0), lse.stride(1),
+            HAS_ATTN_SINK=attn_sink is not None,
+            BLOCK_H=BLOCK_H_COMBINE,
+            BLOCK_D=BLOCK_D_COMBINE,
+            num_warps=4,
+            num_stages=1,
+        )
+
+        return output, lse
+
+    # Use original kernel for smaller topk
+    output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+
     topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    # OPTIMIZED: Swapped grid - (num_h_blocks, total_tokens) for better cache locality
     grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
-
-    # Check if KV cache size exceeds threshold for buffer_ops
-    # When stride * num_blocks > INT32_MAX, AMD buffer_ops can overflow
-    kv_cache_size = stride_kv_block * num_blocks
-    disable_buffer_ops = kv_cache_size > BUFFER_OPS_DISABLE_THRESHOLD
 
     def run_kernel():
         _fused_gather_attn_model1_kernel[grid](
@@ -461,7 +523,6 @@ def fused_gather_attn_decode_model1(
         )
 
     if disable_buffer_ops:
-        # Disable AMD buffer_ops to avoid int32 overflow with large KV cache
         with triton.knobs.amd.scope():
             triton.knobs.amd.use_buffer_ops = False
             run_kernel()
@@ -469,10 +530,6 @@ def fused_gather_attn_decode_model1(
         run_kernel()
 
     return output, lse
-
-
-# ============================================================================
-# MODEL1 Dual-Scope Fused Gather+Dequant+Attention Kernel (OPTIMIZED)
 # Uses helper function to eliminate code duplication
 # ============================================================================
 @triton.autotune(
@@ -845,3 +902,345 @@ def fused_gather_attn_decode_model1_dual_scope(
         run_kernel()
 
     return output, lse
+
+
+# ============================================================================
+# Split-K Optimization for Large TopK (>= 8192)
+# ============================================================================
+SPLITK_TOPK_THRESHOLD = 8192
+SPLITK_DEFAULT = 4
+
+
+@triton.jit
+def _fused_gather_attn_model1_splitk_kernel(
+    Q, KV_Cache, Indices, TopkLength,
+    PartialOutput, PartialLSE,
+    sm_scale, total_tokens, h_q, topk, num_blocks, block_size, s_q,
+    topk_per_split,
+    stride_q_t, stride_q_h, stride_q_d,
+    stride_kv_block,
+    stride_idx_t, stride_idx_k,
+    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
+    stride_plse_s, stride_plse_t, stride_plse_h,
+    HAS_TOPK_LENGTH: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Split-K fused gather+dequant+attention kernel for MODEL1."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    D_NOPE: tl.constexpr = 448
+    TILE_SIZE: tl.constexpr = 64
+    BYTES_PER_TOKEN_DATA: tl.constexpr = 576
+    BYTES_PER_TOKEN_SCALE: tl.constexpr = 8
+
+    pid_h = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    NEG_INF = float("-inf")
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+
+    k_start = pid_k * topk_per_split
+    k_end = tl.minimum(k_start + topk_per_split, topk)
+
+    m_i = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    acc_0 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_1 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_2 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_3 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_4 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_5 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_6 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_7 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+
+    stride_q_t_64 = tl.cast(stride_q_t, tl.int64)
+    q_base = Q + pid_t_64 * stride_q_t_64
+
+    batch_idx = pid_t // s_q
+    offs_tile = tl.arange(0, TILE_SIZE)
+
+    q_row_base = q_base + offs_h[:, None] * stride_q_h
+    q_0 = tl.load(q_row_base + offs_tile[None, :] * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_1 = tl.load(q_row_base + (TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_2 = tl.load(q_row_base + (2*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_3 = tl.load(q_row_base + (3*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_4 = tl.load(q_row_base + (4*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_5 = tl.load(q_row_base + (5*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_6 = tl.load(q_row_base + (6*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_7 = tl.load(q_row_base + (7*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+
+    stride_kv_block_64 = tl.cast(stride_kv_block, tl.int64)
+
+    for n_start in range(k_start, k_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < k_end
+
+        idx_ptrs = Indices + pid_t * stride_idx_t + offs_n * stride_idx_k
+        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+
+        is_invalid = indices == -1
+        if HAS_TOPK_LENGTH:
+            topk_len = tl.load(TopkLength + batch_idx)
+            is_invalid = is_invalid | (offs_n >= topk_len)
+
+        valid = mask_n & ~is_invalid
+        indices_clamped = tl.maximum(indices, 0)
+
+        block_idx = indices_clamped // block_size
+        offset_in_block = indices_clamped % block_size
+
+        block_idx_64 = block_idx.to(tl.int64)
+        offset_in_block_64 = offset_in_block.to(tl.int64)
+
+        kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
+        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+        scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+
+        valid_2d = valid[:, None]
+
+        scale_ptrs = kv_block_base + scale_base_offset
+        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
+
+        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+
+        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+
+        nope_ptrs = tile_base + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+        kv_0 = tl.where(valid_2d, kv_0, 0.0)
+        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+
+        nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+        kv_1 = tl.where(valid_2d, kv_1, 0.0)
+        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+
+        nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+        kv_2 = tl.where(valid_2d, kv_2, 0.0)
+        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+
+        nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+        kv_3 = tl.where(valid_2d, kv_3, 0.0)
+        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+
+        nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+        kv_4 = tl.where(valid_2d, kv_4, 0.0)
+        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+
+        nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+        kv_5 = tl.where(valid_2d, kv_5, 0.0)
+        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+
+        nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
+        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
+        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
+        kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+        kv_6 = tl.where(valid_2d, kv_6, 0.0)
+        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+
+        rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
+        rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+        rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
+        kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
+        kv_7 = tl.where(valid_2d, kv_7, 0.0)
+        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
+
+        qk = qk * sm_scale
+        qk = tl.where(valid[None, :], qk, NEG_INF)
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
+        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
+        l_new = alpha * l_i + tl.sum(p, axis=1)
+        p_bf16 = p.to(tl.bfloat16)
+
+        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
+        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
+        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
+        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
+        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
+        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
+        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
+        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
+
+        m_i = m_new
+        l_i = l_new
+
+    lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
+    is_lonely_q = (l_i == 0.0)
+
+    output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
+    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
+    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
+    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
+    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
+    acc_4 = tl.where(is_lonely_q[:, None], 0.0, acc_4 * output_scale[:, None])
+    acc_5 = tl.where(is_lonely_q[:, None], 0.0, acc_5 * output_scale[:, None])
+    acc_6 = tl.where(is_lonely_q[:, None], 0.0, acc_6 * output_scale[:, None])
+    acc_7 = tl.where(is_lonely_q[:, None], 0.0, acc_7 * output_scale[:, None])
+    lse = tl.where(is_lonely_q, float("+inf"), lse)
+
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+    po_base = PartialOutput + pid_k * stride_po_s_64 + pid_t_64 * stride_po_t_64
+    row_ptrs = po_base + offs_h[:, None] * stride_po_h
+
+    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_1.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_2.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_4.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_5.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_6.to(tl.bfloat16), mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_7.to(tl.bfloat16), mask=mask_h[:, None])
+
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+    plse_ptrs = PartialLSE + pid_k * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h
+    tl.store(plse_ptrs, lse, mask=mask_h)
+
+
+@triton.jit
+def _combine_splitk_kernel(
+    PartialOutput, PartialLSE, AttnSink,
+    Output, LSE,
+    total_tokens, h_q, d_v,
+    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
+    stride_plse_s, stride_plse_t, stride_plse_h,
+    stride_o_t, stride_o_h, stride_o_d,
+    stride_lse_t, stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Combine partial results from split-K kernel (SPLIT_K=4)."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    offs_d = tl.arange(0, BLOCK_D)
+
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+
+    lse_0 = tl.load(PartialLSE + 0 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_1 = tl.load(PartialLSE + 1 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_2 = tl.load(PartialLSE + 2 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_3 = tl.load(PartialLSE + 3 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+
+    lse_0_valid = tl.abs(lse_0) < INF_THRESHOLD
+    lse_1_valid = tl.abs(lse_1) < INF_THRESHOLD
+    lse_2_valid = tl.abs(lse_2) < INF_THRESHOLD
+    lse_3_valid = tl.abs(lse_3) < INF_THRESHOLD
+
+    lse_0_safe = tl.where(lse_0_valid, lse_0, NEG_INF)
+    lse_1_safe = tl.where(lse_1_valid, lse_1, NEG_INF)
+    lse_2_safe = tl.where(lse_2_valid, lse_2, NEG_INF)
+    lse_3_safe = tl.where(lse_3_valid, lse_3, NEG_INF)
+
+    max_lse = tl.maximum(tl.maximum(lse_0_safe, lse_1_safe), tl.maximum(lse_2_safe, lse_3_safe))
+
+    exp_0 = tl.where(lse_0_valid, tl.math.exp2((lse_0_safe - max_lse) * LOG2E), 0.0)
+    exp_1 = tl.where(lse_1_valid, tl.math.exp2((lse_1_safe - max_lse) * LOG2E), 0.0)
+    exp_2 = tl.where(lse_2_valid, tl.math.exp2((lse_2_safe - max_lse) * LOG2E), 0.0)
+    exp_3 = tl.where(lse_3_valid, tl.math.exp2((lse_3_safe - max_lse) * LOG2E), 0.0)
+
+    sum_exp = exp_0 + exp_1 + exp_2 + exp_3
+    all_invalid = sum_exp == 0.0
+    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
+
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        is_lonely = combined_lse > INF_THRESHOLD
+        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+        diff = attn_sink_vals - lse_safe_for_sink
+        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+        denominator = 1.0 + exp_diff
+        sink_scale = 1.0 / denominator
+        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+
+        scale_0 = (exp_0 / sum_exp_safe) * sink_scale
+        scale_1 = (exp_1 / sum_exp_safe) * sink_scale
+        scale_2 = (exp_2 / sum_exp_safe) * sink_scale
+        scale_3 = (exp_3 / sum_exp_safe) * sink_scale
+    else:
+        scale_0 = exp_0 / sum_exp_safe
+        scale_1 = exp_1 / sum_exp_safe
+        scale_2 = exp_2 / sum_exp_safe
+        scale_3 = exp_3 / sum_exp_safe
+
+    scale_0 = tl.where(all_invalid, 0.0, scale_0)
+    scale_1 = tl.where(all_invalid, 0.0, scale_1)
+    scale_2 = tl.where(all_invalid, 0.0, scale_2)
+    scale_3 = tl.where(all_invalid, 0.0, scale_3)
+
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+
+    po_base_0 = PartialOutput + 0 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_1 = PartialOutput + 1 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_2 = PartialOutput + 2 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_3 = PartialOutput + 3 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
+
+    for d_idx in range(4):
+        d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_2 = tl.load(po_base_2 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_3 = tl.load(po_base_3 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        combined = scale_0[:, None] * po_0 + scale_1[:, None] * po_1 + scale_2[:, None] * po_2 + scale_3[:, None] * po_3
+        tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_h[:, None])
+
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
+    tl.store(lse_ptrs, combined_lse, mask=mask_h)
