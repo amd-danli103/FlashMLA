@@ -193,16 +193,16 @@ def _process_kv_block_and_update_acc(
     configs=[
         # Optimized configs with swapped grid for better cache locality
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
     ],
@@ -437,7 +437,7 @@ def fused_gather_attn_decode_model1(
 
     # Use Split-K for large topk
     if topk >= SPLITK_TOPK_THRESHOLD:
-        split_k = SPLITK_DEFAULT
+        split_k = _select_split_k(topk, h_q, total_tokens)
         topk_per_split = (topk + split_k - 1) // split_k
 
         partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
@@ -482,20 +482,30 @@ def fused_gather_attn_decode_model1(
         BLOCK_D_COMBINE = 128
         grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
-        _combine_splitk_kernel[grid_combine](
-            partial_output, partial_lse, attn_sink_tensor,
-            output, lse,
-            total_tokens, h_q, d_v,
-            partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
-            partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
-            output.stride(0), output.stride(1), output.stride(2),
-            lse.stride(0), lse.stride(1),
-            HAS_ATTN_SINK=attn_sink is not None,
-            BLOCK_H=BLOCK_H_COMBINE,
-            BLOCK_D=BLOCK_D_COMBINE,
-            num_warps=4,
-            num_stages=1,
-        )
+        # Select appropriate combine kernel based on split_k
+        if split_k == 2:
+            combine_kernel = _combine_splitk_kernel_2
+        elif split_k == 4:
+            combine_kernel = _combine_splitk_kernel
+        elif split_k == 8:
+            combine_kernel = _combine_splitk_kernel_8
+        else:
+            raise ValueError(f"Unsupported split_k: {split_k}")
+
+        combine_kernel[grid_combine](
+                partial_output, partial_lse, attn_sink_tensor,
+                output, lse,
+                total_tokens, h_q, d_v,
+                partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+                partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+                output.stride(0), output.stride(1), output.stride(2),
+                lse.stride(0), lse.stride(1),
+                HAS_ATTN_SINK=attn_sink is not None,
+                BLOCK_H=BLOCK_H_COMBINE,
+                BLOCK_D=BLOCK_D_COMBINE,
+                num_warps=4,
+                num_stages=1,
+            )
 
         return output, lse
 
@@ -1244,3 +1254,287 @@ def _combine_splitk_kernel(
     stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
     lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
     tl.store(lse_ptrs, combined_lse, mask=mask_h)
+
+
+@triton.jit
+def _combine_splitk_kernel_8(
+    PartialOutput, PartialLSE, AttnSink,
+    Output, LSE,
+    total_tokens, h_q, d_v,
+    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
+    stride_plse_s, stride_plse_t, stride_plse_h,
+    stride_o_t, stride_o_h, stride_o_d,
+    stride_lse_t, stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Combine partial results from split-K kernel (SPLIT_K=8)."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    offs_d = tl.arange(0, BLOCK_D)
+
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+
+    # Load all 8 LSE values
+    lse_0 = tl.load(PartialLSE + 0 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_1 = tl.load(PartialLSE + 1 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_2 = tl.load(PartialLSE + 2 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_3 = tl.load(PartialLSE + 3 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_4 = tl.load(PartialLSE + 4 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_5 = tl.load(PartialLSE + 5 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_6 = tl.load(PartialLSE + 6 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_7 = tl.load(PartialLSE + 7 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+
+    lse_0_valid = tl.abs(lse_0) < INF_THRESHOLD
+    lse_1_valid = tl.abs(lse_1) < INF_THRESHOLD
+    lse_2_valid = tl.abs(lse_2) < INF_THRESHOLD
+    lse_3_valid = tl.abs(lse_3) < INF_THRESHOLD
+    lse_4_valid = tl.abs(lse_4) < INF_THRESHOLD
+    lse_5_valid = tl.abs(lse_5) < INF_THRESHOLD
+    lse_6_valid = tl.abs(lse_6) < INF_THRESHOLD
+    lse_7_valid = tl.abs(lse_7) < INF_THRESHOLD
+
+    lse_0_safe = tl.where(lse_0_valid, lse_0, NEG_INF)
+    lse_1_safe = tl.where(lse_1_valid, lse_1, NEG_INF)
+    lse_2_safe = tl.where(lse_2_valid, lse_2, NEG_INF)
+    lse_3_safe = tl.where(lse_3_valid, lse_3, NEG_INF)
+    lse_4_safe = tl.where(lse_4_valid, lse_4, NEG_INF)
+    lse_5_safe = tl.where(lse_5_valid, lse_5, NEG_INF)
+    lse_6_safe = tl.where(lse_6_valid, lse_6, NEG_INF)
+    lse_7_safe = tl.where(lse_7_valid, lse_7, NEG_INF)
+
+    max_lse = tl.maximum(tl.maximum(tl.maximum(lse_0_safe, lse_1_safe), tl.maximum(lse_2_safe, lse_3_safe)),
+                         tl.maximum(tl.maximum(lse_4_safe, lse_5_safe), tl.maximum(lse_6_safe, lse_7_safe)))
+
+    exp_0 = tl.where(lse_0_valid, tl.math.exp2((lse_0_safe - max_lse) * LOG2E), 0.0)
+    exp_1 = tl.where(lse_1_valid, tl.math.exp2((lse_1_safe - max_lse) * LOG2E), 0.0)
+    exp_2 = tl.where(lse_2_valid, tl.math.exp2((lse_2_safe - max_lse) * LOG2E), 0.0)
+    exp_3 = tl.where(lse_3_valid, tl.math.exp2((lse_3_safe - max_lse) * LOG2E), 0.0)
+    exp_4 = tl.where(lse_4_valid, tl.math.exp2((lse_4_safe - max_lse) * LOG2E), 0.0)
+    exp_5 = tl.where(lse_5_valid, tl.math.exp2((lse_5_safe - max_lse) * LOG2E), 0.0)
+    exp_6 = tl.where(lse_6_valid, tl.math.exp2((lse_6_safe - max_lse) * LOG2E), 0.0)
+    exp_7 = tl.where(lse_7_valid, tl.math.exp2((lse_7_safe - max_lse) * LOG2E), 0.0)
+
+    sum_exp = exp_0 + exp_1 + exp_2 + exp_3 + exp_4 + exp_5 + exp_6 + exp_7
+    all_invalid = sum_exp == 0.0
+    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
+
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        is_lonely = combined_lse > INF_THRESHOLD
+        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+        diff = attn_sink_vals - lse_safe_for_sink
+        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+        denominator = 1.0 + exp_diff
+        sink_scale = 1.0 / denominator
+        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+
+        scale_0 = (exp_0 / sum_exp_safe) * sink_scale
+        scale_1 = (exp_1 / sum_exp_safe) * sink_scale
+        scale_2 = (exp_2 / sum_exp_safe) * sink_scale
+        scale_3 = (exp_3 / sum_exp_safe) * sink_scale
+        scale_4 = (exp_4 / sum_exp_safe) * sink_scale
+        scale_5 = (exp_5 / sum_exp_safe) * sink_scale
+        scale_6 = (exp_6 / sum_exp_safe) * sink_scale
+        scale_7 = (exp_7 / sum_exp_safe) * sink_scale
+    else:
+        scale_0 = exp_0 / sum_exp_safe
+        scale_1 = exp_1 / sum_exp_safe
+        scale_2 = exp_2 / sum_exp_safe
+        scale_3 = exp_3 / sum_exp_safe
+        scale_4 = exp_4 / sum_exp_safe
+        scale_5 = exp_5 / sum_exp_safe
+        scale_6 = exp_6 / sum_exp_safe
+        scale_7 = exp_7 / sum_exp_safe
+
+    scale_0 = tl.where(all_invalid, 0.0, scale_0)
+    scale_1 = tl.where(all_invalid, 0.0, scale_1)
+    scale_2 = tl.where(all_invalid, 0.0, scale_2)
+    scale_3 = tl.where(all_invalid, 0.0, scale_3)
+    scale_4 = tl.where(all_invalid, 0.0, scale_4)
+    scale_5 = tl.where(all_invalid, 0.0, scale_5)
+    scale_6 = tl.where(all_invalid, 0.0, scale_6)
+    scale_7 = tl.where(all_invalid, 0.0, scale_7)
+
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+
+    po_base_0 = PartialOutput + 0 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_1 = PartialOutput + 1 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_2 = PartialOutput + 2 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_3 = PartialOutput + 3 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_4 = PartialOutput + 4 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_5 = PartialOutput + 5 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_6 = PartialOutput + 6 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_7 = PartialOutput + 7 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
+
+    for d_idx in range(4):
+        d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_2 = tl.load(po_base_2 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_3 = tl.load(po_base_3 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_4 = tl.load(po_base_4 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_5 = tl.load(po_base_5 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_6 = tl.load(po_base_6 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_7 = tl.load(po_base_7 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        combined = (scale_0[:, None] * po_0 + scale_1[:, None] * po_1 +
+                   scale_2[:, None] * po_2 + scale_3[:, None] * po_3 +
+                   scale_4[:, None] * po_4 + scale_5[:, None] * po_5 +
+                   scale_6[:, None] * po_6 + scale_7[:, None] * po_7)
+        tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_h[:, None])
+
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
+    tl.store(lse_ptrs, combined_lse, mask=mask_h)
+
+
+@triton.jit
+def _combine_splitk_kernel_2(
+    PartialOutput, PartialLSE, AttnSink,
+    Output, LSE,
+    total_tokens, h_q, d_v,
+    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
+    stride_plse_s, stride_plse_t, stride_plse_h,
+    stride_o_t, stride_o_h, stride_o_d,
+    stride_lse_t, stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Combine partial results from split-K kernel (SPLIT_K=2)."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    offs_d = tl.arange(0, BLOCK_D)
+
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+
+    lse_0 = tl.load(PartialLSE + 0 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+    lse_1 = tl.load(PartialLSE + 1 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
+
+    lse_0_valid = tl.abs(lse_0) < INF_THRESHOLD
+    lse_1_valid = tl.abs(lse_1) < INF_THRESHOLD
+
+    lse_0_safe = tl.where(lse_0_valid, lse_0, NEG_INF)
+    lse_1_safe = tl.where(lse_1_valid, lse_1, NEG_INF)
+
+    max_lse = tl.maximum(lse_0_safe, lse_1_safe)
+
+    exp_0 = tl.where(lse_0_valid, tl.math.exp2((lse_0_safe - max_lse) * LOG2E), 0.0)
+    exp_1 = tl.where(lse_1_valid, tl.math.exp2((lse_1_safe - max_lse) * LOG2E), 0.0)
+
+    sum_exp = exp_0 + exp_1
+    all_invalid = sum_exp == 0.0
+    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
+
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        is_lonely = combined_lse > INF_THRESHOLD
+        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+        diff = attn_sink_vals - lse_safe_for_sink
+        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+        denominator = 1.0 + exp_diff
+        sink_scale = 1.0 / denominator
+        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+
+        scale_0 = (exp_0 / sum_exp_safe) * sink_scale
+        scale_1 = (exp_1 / sum_exp_safe) * sink_scale
+    else:
+        scale_0 = exp_0 / sum_exp_safe
+        scale_1 = exp_1 / sum_exp_safe
+
+    scale_0 = tl.where(all_invalid, 0.0, scale_0)
+    scale_1 = tl.where(all_invalid, 0.0, scale_1)
+
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+
+    po_base_0 = PartialOutput + 0 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+    po_base_1 = PartialOutput + 1 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
+
+    for d_idx in range(4):
+        d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
+        combined = scale_0[:, None] * po_0 + scale_1[:, None] * po_1
+        tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_h[:, None])
+
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
+    tl.store(lse_ptrs, combined_lse, mask=mask_h)
+
+
+def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
+    """Select optimal split_k based on topk, h_q, and total_tokens.
+
+    The split_k parameter controls how many parallel splits are used to process
+    the topk dimension. Larger split_k increases parallelism but also increases
+    the overhead of the combine kernel.
+
+    Heuristics (based on benchmarking on AMD MI300X):
+    - For large topk (>= 16384) with large total_tokens (>= 128): split_k=8
+    - For large topk with medium total_tokens (64-127): split_k=4 for h_q=64, split_k=8 for h_q=128
+    - For large topk with small total_tokens (<= 64): split_k=8 for h_q=64, split_k=4 for h_q=128
+    - For medium topk (8192-16383): split_k=4
+    - For small topk (< 8192): split_k=2
+
+    The key insight is that optimal split_k balances:
+    1. Parallelism in K dimension (higher split_k = more parallelism)
+    2. Combine kernel overhead (higher split_k = more overhead)
+    3. GPU occupancy (total_tokens * ceil(h_q/BLOCK_H) * split_k)
+
+    Benchmark results for b=148 (total_tokens=296), topk=16384:
+    - h_q=64:  split_k=8 best (5975 us), split_k=4 (6042 us), split_k=2 (6972 us)
+    - h_q=128: split_k=8 best (11247 us), split_k=4 (11434 us), split_k=2 (11664 us)
+    """
+    if topk >= 16384:
+        # For very large topk, split_k=8 is generally best for large batches
+        if total_tokens >= 128:
+            return 8
+        elif total_tokens >= 64:
+            # Medium batch: split_k=4 for h_q=64, split_k=8 for h_q=128
+            return 4 if h_q <= 64 else 8
+        else:
+            # Small batch: need more parallelism
+            return 8 if h_q <= 64 else 4
+    elif topk >= 8192:
+        return 4
+    else:
+        return 2
