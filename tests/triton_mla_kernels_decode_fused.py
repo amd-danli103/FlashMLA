@@ -191,14 +191,20 @@ def _process_kv_block_and_update_acc(
 # ============================================================================
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        # Optimized configs with swapped grid for better cache locality
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens", "h_q", "topk"],
 )
@@ -225,8 +231,9 @@ def _fused_gather_attn_model1_kernel(
     BYTES_PER_TOKEN_DATA: tl.constexpr = 576
     BYTES_PER_TOKEN_SCALE: tl.constexpr = 8
 
-    pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    # OPTIMIZED: Swapped grid - pid_h first for better cache locality
+    pid_h = tl.program_id(0)
+    pid_t = tl.program_id(1)
     pid_t_64 = pid_t.to(tl.int64)
 
     NEG_INF = float("-inf")
@@ -431,7 +438,8 @@ def fused_gather_attn_decode_model1(
     topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    # OPTIMIZED: Swapped grid - (num_h_blocks, total_tokens) for better cache locality
+    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
 
     # Check if KV cache size exceeds threshold for buffer_ops
     # When stride * num_blocks > INT32_MAX, AMD buffer_ops can overflow
