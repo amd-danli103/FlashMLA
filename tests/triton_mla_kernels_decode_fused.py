@@ -803,6 +803,238 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
+
+# ============================================================================
+# Split-K Kernel for Dual Scope
+# ============================================================================
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+    ],
+    key=["total_tokens", "h_q", "topk_per_split"],
+)
+@triton.jit
+def _fused_gather_attn_model1_dual_scope_splitk_kernel(
+    Q,
+    KV_Cache_Main, Indices_Main, TopkLength_Main,
+    KV_Cache_Extra, Indices_Extra, TopkLength_Extra,
+    PartialOutput, PartialLSE,
+    sm_scale, total_tokens, h_q,
+    topk_main, num_blocks_main, block_size_main,
+    topk_extra, num_blocks_extra, block_size_extra,
+    s_q, topk_per_split,
+    stride_q_t, stride_q_h, stride_q_d,
+    stride_kv_block_main, stride_kv_block_extra,
+    stride_idx_main_t, stride_idx_main_k,
+    stride_idx_extra_t, stride_idx_extra_k,
+    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
+    stride_plse_s, stride_plse_t, stride_plse_h,
+    HAS_TOPK_LENGTH_MAIN: tl.constexpr,
+    HAS_TOPK_LENGTH_EXTRA: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Split-K fused gather+dequant+attention kernel for MODEL1 with dual scope.
+
+    This kernel processes a portion of the combined topk range (main + extra).
+    Each split handles topk_per_split tokens from the combined range.
+    """
+    LOG2E: tl.constexpr = 1.4426950408889634
+    D_NOPE: tl.constexpr = 448
+    TILE_SIZE: tl.constexpr = 64
+    BYTES_PER_TOKEN_DATA: tl.constexpr = 576
+    BYTES_PER_TOKEN_SCALE: tl.constexpr = 8
+
+    pid_h = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    NEG_INF = float("-inf")
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+
+    # Calculate the range for this split
+    total_topk = topk_main + topk_extra
+    k_start = pid_k * topk_per_split
+    k_end = tl.minimum(k_start + topk_per_split, total_topk)
+
+    # Initialize accumulators
+    m_i = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    acc_0 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_1 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_2 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_3 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_4 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_5 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_6 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+    acc_7 = tl.zeros([BLOCK_H, TILE_SIZE], dtype=tl.float32)
+
+    stride_q_t_64 = tl.cast(stride_q_t, tl.int64)
+    q_base = Q + pid_t_64 * stride_q_t_64
+
+    batch_idx = pid_t // s_q
+    offs_tile = tl.arange(0, TILE_SIZE)
+
+    # Load Q tiles (shared by both scopes)
+    q_row_base = q_base + offs_h[:, None] * stride_q_h
+    q_0 = tl.load(q_row_base + offs_tile[None, :] * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_1 = tl.load(q_row_base + (TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_2 = tl.load(q_row_base + (2*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_3 = tl.load(q_row_base + (3*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_4 = tl.load(q_row_base + (4*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_5 = tl.load(q_row_base + (5*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_6 = tl.load(q_row_base + (6*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+    q_7 = tl.load(q_row_base + (7*TILE_SIZE + offs_tile[None, :]) * stride_q_d, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+
+    stride_kv_block_main_64 = tl.cast(stride_kv_block_main, tl.int64)
+    stride_kv_block_extra_64 = tl.cast(stride_kv_block_extra, tl.int64)
+
+    # Process the combined range [k_start, k_end)
+    # First, process MAIN scope portion (indices 0 to topk_main-1)
+    main_start = k_start
+    main_end = tl.minimum(k_end, topk_main)
+
+    for n_start in range(main_start, main_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < main_end
+
+        idx_ptrs = Indices_Main + pid_t * stride_idx_main_t + offs_n * stride_idx_main_k
+        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+
+        is_invalid = indices == -1
+        if HAS_TOPK_LENGTH_MAIN:
+            topk_len = tl.load(TopkLength_Main + batch_idx)
+            is_invalid = is_invalid | (offs_n >= topk_len)
+
+        valid = mask_n & ~is_invalid
+        indices_clamped = tl.maximum(indices, 0)
+
+        block_idx = indices_clamped // block_size_main
+        offset_in_block = indices_clamped % block_size_main
+
+        block_idx_64 = block_idx.to(tl.int64)
+        offset_in_block_64 = offset_in_block.to(tl.int64)
+
+        kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
+        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+        scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+
+        valid_2d = valid[:, None]
+
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_and_update_acc(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
+
+    # Process EXTRA scope portion (indices topk_main to topk_main+topk_extra-1)
+    extra_global_start = tl.maximum(k_start, topk_main)
+    extra_global_end = k_end
+
+    for n_global in range(extra_global_start, extra_global_end, BLOCK_N):
+        offs_n_local = (n_global - topk_main) + tl.arange(0, BLOCK_N)
+        offs_n_global = n_global + tl.arange(0, BLOCK_N)
+        mask_n = offs_n_global < extra_global_end
+
+        idx_ptrs = Indices_Extra + pid_t * stride_idx_extra_t + offs_n_local * stride_idx_extra_k
+        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+
+        is_invalid = indices == -1
+        if HAS_TOPK_LENGTH_EXTRA:
+            topk_len = tl.load(TopkLength_Extra + batch_idx)
+            is_invalid = is_invalid | (offs_n_local >= topk_len)
+
+        valid = mask_n & ~is_invalid
+        indices_clamped = tl.maximum(indices, 0)
+
+        block_idx = indices_clamped // block_size_extra
+        offset_in_block = indices_clamped % block_size_extra
+
+        block_idx_64 = block_idx.to(tl.int64)
+        offset_in_block_64 = offset_in_block.to(tl.int64)
+
+        kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
+        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+        scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+
+        valid_2d = valid[:, None]
+
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_and_update_acc(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
+
+    # Finalize: compute partial LSE and store partial output
+    lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
+    is_lonely_q = (l_i == 0.0)
+
+    output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
+
+    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
+    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
+    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
+    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
+    acc_4 = tl.where(is_lonely_q[:, None], 0.0, acc_4 * output_scale[:, None])
+    acc_5 = tl.where(is_lonely_q[:, None], 0.0, acc_5 * output_scale[:, None])
+    acc_6 = tl.where(is_lonely_q[:, None], 0.0, acc_6 * output_scale[:, None])
+    acc_7 = tl.where(is_lonely_q[:, None], 0.0, acc_7 * output_scale[:, None])
+    lse = tl.where(is_lonely_q, float("+inf"), lse)
+
+    # Store partial output
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+    po_base = PartialOutput + pid_k * stride_po_s_64 + pid_t_64 * stride_po_t_64
+
+    o_0 = acc_0.to(tl.bfloat16)
+    o_1 = acc_1.to(tl.bfloat16)
+    o_2 = acc_2.to(tl.bfloat16)
+    o_3 = acc_3.to(tl.bfloat16)
+    o_4 = acc_4.to(tl.bfloat16)
+    o_5 = acc_5.to(tl.bfloat16)
+    o_6 = acc_6.to(tl.bfloat16)
+    o_7 = acc_7.to(tl.bfloat16)
+
+    row_ptrs = po_base + offs_h[:, None] * stride_po_h
+
+    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, o_0, mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_1, mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_2, mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_3, mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_4, mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_5, mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_6, mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_7, mask=mask_h[:, None])
+
+    # Store partial LSE
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+    lse_ptrs = PartialLSE + pid_k * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h
+    tl.store(lse_ptrs, lse, mask=mask_h)
+
+
 def fused_gather_attn_decode_model1_dual_scope(
     q: torch.Tensor,
     kv_cache_main: torch.Tensor,
@@ -819,9 +1051,7 @@ def fused_gather_attn_decode_model1_dual_scope(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused gather+dequant+attention for MODEL1 with dual scope (main + extra).
-
-    This kernel processes both main and extra KV scopes in a single kernel,
-    treating the key sequence as [main_topk, extra_topk] concatenated.
+    Uses Split-K optimization for large total_topk (>= SPLITK_TOPK_THRESHOLD).
 
     Args:
         q: Query tensor [total_tokens, h_q, d_qk]
@@ -844,49 +1074,129 @@ def fused_gather_attn_decode_model1_dual_scope(
     total_tokens, h_q, d_qk = q.shape
     topk_main = indices_main.shape[1]
     topk_extra = indices_extra.shape[1]
+    total_topk = topk_main + topk_extra
     d_v = MODEL1_D_V
     device = q.device
 
     # Prepare main KV cache
     kv_uint8_main = kv_cache_main.view(torch.uint8)
-    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks_main = kv_cache_main.shape[0]
     stride_kv_block_main = kv_uint8_main.stride(0)
     kv_flat_main = kv_uint8_main.reshape(num_blocks_main, -1)
 
     # Prepare extra KV cache
     kv_uint8_extra = kv_cache_extra.view(torch.uint8)
-    # Note: kv_uint8 may not be contiguous, but that's OK - we use stride(0) for correct access
     num_blocks_extra = kv_cache_extra.shape[0]
     stride_kv_block_extra = kv_uint8_extra.stride(0)
     kv_flat_extra = kv_uint8_extra.reshape(num_blocks_extra, -1)
 
-    output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
-    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
-
     if q.dtype != torch.bfloat16 or not q.is_contiguous():
         q = q.to(torch.bfloat16).contiguous()
 
-    # Ensure indices are contiguous
     if not indices_main.is_contiguous():
         indices_main = indices_main.contiguous()
     if not indices_extra.is_contiguous():
         indices_extra = indices_extra.contiguous()
 
-    # Dummy tensors for optional parameters
-    topk_length_main_tensor = topk_length_main if topk_length_main is not None else lse[:1, 0]
-    topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else lse[:1, 0]
-    attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
-
-    # Use lambda grid for autotune (BLOCK_H is determined by autotune)
-    # OPTIMIZED: Swapped grid - (num_h_blocks, total_tokens) for better cache locality
-    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
-
-    # Check if either KV cache size exceeds threshold for buffer_ops
     kv_cache_size_main = stride_kv_block_main * num_blocks_main
     kv_cache_size_extra = stride_kv_block_extra * num_blocks_extra
     disable_buffer_ops = (kv_cache_size_main > BUFFER_OPS_DISABLE_THRESHOLD or
                           kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD)
+
+    # Use Split-K for dual scope when total_tokens > 64 (small batches use non-split-K for better performance)
+    if total_tokens > 64:  # Split-K benefits larger batches
+        split_k = _select_split_k(total_topk, h_q, total_tokens)
+        topk_per_split = (total_topk + split_k - 1) // split_k
+
+        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
+        output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+
+        topk_length_main_tensor = topk_length_main if topk_length_main is not None else lse[:1, 0]
+        topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else lse[:1, 0]
+        attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
+
+        grid_splitk = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens, split_k)
+
+        def run_splitk_kernel():
+            _fused_gather_attn_model1_dual_scope_splitk_kernel[grid_splitk](
+                q,
+                kv_flat_main, indices_main, topk_length_main_tensor,
+                kv_flat_extra, indices_extra, topk_length_extra_tensor,
+                partial_output, partial_lse,
+                sm_scale, total_tokens, h_q,
+                topk_main, num_blocks_main, block_size_main,
+                topk_extra, num_blocks_extra, block_size_extra,
+                s_q, topk_per_split,
+                q.stride(0), q.stride(1), q.stride(2),
+                stride_kv_block_main, stride_kv_block_extra,
+                indices_main.stride(0), indices_main.stride(1),
+                indices_extra.stride(0), indices_extra.stride(1),
+                partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+                partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+                HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
+                HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
+            )
+
+        if disable_buffer_ops:
+            with triton.knobs.amd.scope():
+                triton.knobs.amd.use_buffer_ops = False
+                run_splitk_kernel()
+        else:
+            run_splitk_kernel()
+
+        # Use appropriate combine kernel based on split_k
+        if split_k == 8:
+            grid_combine = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+            _combine_splitk_kernel_8_optimized[grid_combine](
+                partial_output, partial_lse, attn_sink_tensor,
+                output, lse,
+                total_tokens, h_q, d_v,
+                partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+                partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+                output.stride(0), output.stride(1), output.stride(2),
+                lse.stride(0), lse.stride(1),
+                HAS_ATTN_SINK=attn_sink is not None,
+            )
+        else:
+            BLOCK_H_COMBINE = 16
+            BLOCK_D_COMBINE = 128
+            grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
+
+            if split_k == 2:
+                combine_kernel = _combine_splitk_kernel_2
+            elif split_k == 4:
+                combine_kernel = _combine_splitk_kernel
+            else:
+                raise ValueError(f"Unsupported split_k: {split_k}")
+
+            combine_kernel[grid_combine](
+                partial_output, partial_lse, attn_sink_tensor,
+                output, lse,
+                total_tokens, h_q, d_v,
+                partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
+                partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+                output.stride(0), output.stride(1), output.stride(2),
+                lse.stride(0), lse.stride(1),
+                HAS_ATTN_SINK=attn_sink is not None,
+                BLOCK_H=BLOCK_H_COMBINE,
+                BLOCK_D=BLOCK_D_COMBINE,
+                num_warps=4,
+                num_stages=1,
+            )
+
+        return output, lse
+
+    # Use original kernel for smaller total_topk
+    output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+
+    topk_length_main_tensor = topk_length_main if topk_length_main is not None else lse[:1, 0]
+    topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else lse[:1, 0]
+    attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
+
+    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
 
     def run_kernel():
         _fused_gather_attn_model1_dual_scope_kernel[grid](
@@ -911,7 +1221,6 @@ def fused_gather_attn_decode_model1_dual_scope(
         )
 
     if disable_buffer_ops:
-        # Disable AMD buffer_ops to avoid int32 overflow with large KV cache
         with triton.knobs.amd.scope():
             triton.knobs.amd.use_buffer_ops = False
             run_kernel()
@@ -919,6 +1228,7 @@ def fused_gather_attn_decode_model1_dual_scope(
         run_kernel()
 
     return output, lse
+
 
 
 # ============================================================================
