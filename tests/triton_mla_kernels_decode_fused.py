@@ -551,21 +551,25 @@ def fused_gather_attn_decode_model1(
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Configs optimized for small batch (total_tokens <= 64)
-        # Smaller BLOCK_H for better parallelism with few tokens
-        # Larger BLOCK_N to reduce loop iterations
+        # Configs for various batch sizes and head counts
+        # num_warps=4 configs
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        # For h_q=128 case, allow BLOCK_H=128 but with smaller warps
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        # num_warps=8 configs for better occupancy on larger batches
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens", "h_q", "topk_main", "topk_extra"],
 )
@@ -1103,8 +1107,10 @@ def fused_gather_attn_decode_model1_dual_scope(
     disable_buffer_ops = (kv_cache_size_main > BUFFER_OPS_DISABLE_THRESHOLD or
                           kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD)
 
-    # Use Split-K for dual scope when total_tokens > 64 (small batches use non-split-K for better performance)
-    if total_tokens > 64:  # Split-K benefits larger batches
+    # Use Split-K for dual scope when total_tokens > 64 AND total_topk >= threshold
+    # For small topk, non-splitk kernel is more efficient due to lower overhead
+    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048  # Only use splitk for larger topk
+    if total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD:
         split_k = _select_split_k(total_topk, h_q, total_tokens)
         topk_per_split = (total_topk + split_k - 1) // split_k
 

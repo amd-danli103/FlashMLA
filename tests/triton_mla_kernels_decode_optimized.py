@@ -135,8 +135,21 @@ def _triton_sparse_attn_decode_optimized(
             from triton_mla_kernels_decode_v32 import triton_sparse_attn_decode_v32
             return triton_sparse_attn_decode_v32(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
 
-    # Use fused dual-scope kernel when total tokens is small
-    if extra_kv_scope is not None and fused_attn_dual_fn is not None and total_tokens <= FUSED_KERNEL_TOTAL_TOKENS_THRESHOLD:
+    # Use fused dual-scope kernel for MODEL1 dual scope cases
+    # Based on benchmarking, fused kernel is efficient for:
+    # - Small batches with small topk (total_tokens <= 256 for h_q=64, total_topk <= 800)
+    # - Very small batches (total_tokens <= 4) for all cases
+    # For larger batches or larger topk, fall back to 2-phase approach
+    def _should_use_fused_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> bool:
+        # Always use fused for very small batches
+        if total_tokens <= 4:
+            return True
+        # For h_q=64 with small topk, fused is efficient up to total_tokens=256
+        if h_q <= 64 and total_topk <= 800:
+            return total_tokens <= 256
+        # For other cases, fall back to 2-phase
+        return False
+    if extra_kv_scope is not None and fused_attn_dual_fn is not None and _should_use_fused_dual_scope(total_tokens, h_q, total_topk):
         q_reshaped = q.reshape(total_tokens, h_q, d_qk)
         if not q_reshaped.is_contiguous():
             q_reshaped = q_reshaped.contiguous()
