@@ -191,17 +191,14 @@ def _process_kv_block_and_update_acc(
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Optimized configs with swapped grid for better cache locality
+        # Removed 3 exact duplicates
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
