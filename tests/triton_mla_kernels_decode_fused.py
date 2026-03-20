@@ -1347,60 +1347,56 @@ def _fused_gather_attn_model1_splitk_kernel(
         scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
 
         tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
-        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-        nope_ptrs = tile_base + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-        kv_0 = tl.where(valid_2d, kv_0, 0.0)
-        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
-
-        nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-        kv_1 = tl.where(valid_2d, kv_1, 0.0)
-        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
-
-        nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-        kv_2 = tl.where(valid_2d, kv_2, 0.0)
-        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
-
-        nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-        kv_3 = tl.where(valid_2d, kv_3, 0.0)
-        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
-
-        nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-        kv_4 = tl.where(valid_2d, kv_4, 0.0)
-        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
-
-        nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-        kv_5 = tl.where(valid_2d, kv_5, 0.0)
-        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
-
-        nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
-        nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-        nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-        kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-        kv_6 = tl.where(valid_2d, kv_6, 0.0)
-        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
-
+        # Batch load all tiles first for better memory efficiency
+        nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_1 = tl.load(tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_2 = tl.load(tile_base + 2*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_3 = tl.load(tile_base + 3*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_4 = tl.load(tile_base + 4*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_5 = tl.load(tile_base + 5*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_6 = tl.load(tile_base + 6*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
         rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
         rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
         rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
+
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+
+        nope_fp8_0 = nope_uint8_0.to(tl.float8e4nv, bitcast=True)
+        kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+        kv_0 = tl.where(valid_2d, kv_0, 0.0)
+        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+
+        nope_fp8_1 = nope_uint8_1.to(tl.float8e4nv, bitcast=True)
+        kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+        kv_1 = tl.where(valid_2d, kv_1, 0.0)
+        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+
+        nope_fp8_2 = nope_uint8_2.to(tl.float8e4nv, bitcast=True)
+        kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+        kv_2 = tl.where(valid_2d, kv_2, 0.0)
+        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+
+        nope_fp8_3 = nope_uint8_3.to(tl.float8e4nv, bitcast=True)
+        kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+        kv_3 = tl.where(valid_2d, kv_3, 0.0)
+        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+
+        nope_fp8_4 = nope_uint8_4.to(tl.float8e4nv, bitcast=True)
+        kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+        kv_4 = tl.where(valid_2d, kv_4, 0.0)
+        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+
+        nope_fp8_5 = nope_uint8_5.to(tl.float8e4nv, bitcast=True)
+        kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+        kv_5 = tl.where(valid_2d, kv_5, 0.0)
+        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+
+        nope_fp8_6 = nope_uint8_6.to(tl.float8e4nv, bitcast=True)
+        kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+        kv_6 = tl.where(valid_2d, kv_6, 0.0)
+        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+
         kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
         kv_7 = tl.where(valid_2d, kv_7, 0.0)
         qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
