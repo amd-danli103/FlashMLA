@@ -355,7 +355,7 @@ def slice_kv_scope_for_tokens(orig_scope, start_t: int, end_t: int, s_q: int):
 
 
 def compute_token_ranges(total_tokens: int, total_topk: int, d_qk: int,
-                         max_buffer_bytes: int = 4 * 1024 * 1024 * 1024) -> List[Tuple[int, int]]:
+                         max_buffer_bytes: int = 2 * 1024 * 1024 * 1024) -> List[Tuple[int, int]]:
     """Compute token ranges for processing, chunking if buffer would exceed limit."""
     buffer_size_bytes = total_tokens * total_topk * d_qk * 2
 
