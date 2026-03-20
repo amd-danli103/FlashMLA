@@ -42,7 +42,7 @@ MODEL1_BYTES_PER_TOKEN_SCALE = 8   # 7 scales + 1 padding
 # This is the core computation shared by both single and dual scope kernels
 # ============================================================================
 @triton.jit
-def _process_kv_block_and_update_acc(
+def _process_kv_block_aggressive(
     # KV cache parameters
     kv_block_base,
     nope_rope_offset,
@@ -66,16 +66,11 @@ def _process_kv_block_and_update_acc(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Process one block of KV tokens: load, dequantize, compute QK, update accumulators.
-
-    This helper function encapsulates the core computation that is repeated for
-    both MAIN and EXTRA scopes, eliminating code duplication.
-
-    Returns updated accumulators and softmax state.
+    Process one block of KV tokens with batch loading.
+    Key optimization: Load all KV tiles first, then process them.
     """
     NEG_INF = float("-inf")
 
-    # Load scales
     scale_ptrs = kv_block_base + scale_base_offset
     scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
     scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
@@ -85,6 +80,20 @@ def _process_kv_block_and_update_acc(
     scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
     scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
 
+    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+
+    # Batch load all tiles
+    nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_1 = tl.load(tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_2 = tl.load(tile_base + 2*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_3 = tl.load(tile_base + 3*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_4 = tl.load(tile_base + 4*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_5 = tl.load(tile_base + 5*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    nope_uint8_6 = tl.load(tile_base + 6*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+    rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
+    rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+    rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
+
     scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
@@ -93,79 +102,50 @@ def _process_kv_block_and_update_acc(
     scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
 
-    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
-
     qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-    # Tile 0: nope (FP8)
-    nope_ptrs = tile_base + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_0 = (nope_fp8.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+    nope_fp8_0 = nope_uint8_0.to(tl.float8e4nv, bitcast=True)
+    kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
     kv_0 = tl.where(valid_2d, kv_0, 0.0)
     qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
 
-    # Tile 1: nope (FP8)
-    nope_ptrs = tile_base + TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_1 = (nope_fp8.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+    nope_fp8_1 = nope_uint8_1.to(tl.float8e4nv, bitcast=True)
+    kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
     kv_1 = tl.where(valid_2d, kv_1, 0.0)
     qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
 
-    # Tile 2: nope (FP8)
-    nope_ptrs = tile_base + 2*TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_2 = (nope_fp8.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+    nope_fp8_2 = nope_uint8_2.to(tl.float8e4nv, bitcast=True)
+    kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
     kv_2 = tl.where(valid_2d, kv_2, 0.0)
     qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
 
-    # Tile 3: nope (FP8)
-    nope_ptrs = tile_base + 3*TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_3 = (nope_fp8.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+    nope_fp8_3 = nope_uint8_3.to(tl.float8e4nv, bitcast=True)
+    kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
     kv_3 = tl.where(valid_2d, kv_3, 0.0)
     qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
 
-    # Tile 4: nope (FP8)
-    nope_ptrs = tile_base + 4*TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_4 = (nope_fp8.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+    nope_fp8_4 = nope_uint8_4.to(tl.float8e4nv, bitcast=True)
+    kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
     kv_4 = tl.where(valid_2d, kv_4, 0.0)
     qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
 
-    # Tile 5: nope (FP8)
-    nope_ptrs = tile_base + 5*TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_5 = (nope_fp8.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+    nope_fp8_5 = nope_uint8_5.to(tl.float8e4nv, bitcast=True)
+    kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
     kv_5 = tl.where(valid_2d, kv_5, 0.0)
     qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
 
-    # Tile 6: nope (FP8)
-    nope_ptrs = tile_base + 6*TILE_SIZE + offs_tile[None, :]
-    nope_uint8 = tl.load(nope_ptrs, mask=valid_2d, other=0)
-    nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
-    kv_6 = (nope_fp8.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+    nope_fp8_6 = nope_uint8_6.to(tl.float8e4nv, bitcast=True)
+    kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
     kv_6 = tl.where(valid_2d, kv_6, 0.0)
     qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
 
-    # Tile 7: rope (BF16) - optimized: single base pointer
-    rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-    rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
     kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
     kv_7 = tl.where(valid_2d, kv_7, 0.0)
     qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
 
-    # Apply softmax scale and mask
     qk = qk * sm_scale
     qk = tl.where(valid[None, :], qk, NEG_INF)
 
-    # Online softmax update
     m_ij = tl.max(qk, axis=1)
     m_new = tl.maximum(m_i, m_ij)
     alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
@@ -173,7 +153,6 @@ def _process_kv_block_and_update_acc(
     l_new = alpha * l_i + tl.sum(p, axis=1)
     p_bf16 = p.to(tl.bfloat16)
 
-    # Update accumulators
     acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
     acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
     acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
@@ -303,7 +282,7 @@ def _fused_gather_attn_model1_kernel(
 
         # Use helper function for KV processing
         acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_and_update_acc(
+            _process_kv_block_aggressive(
                 kv_block_base, nope_rope_offset, scale_base_offset,
                 valid, valid_2d,
                 q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
@@ -548,8 +527,7 @@ def fused_gather_attn_decode_model1(
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Configs for various batch sizes and head counts
-        # num_warps=4 configs
+        # num_warps=4, num_stages=1 configs
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
@@ -558,7 +536,7 @@ def fused_gather_attn_decode_model1(
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        # num_warps=8 configs for better occupancy on larger batches
+        # num_warps=8, num_stages=1 configs
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=8, num_stages=1),
@@ -567,6 +545,11 @@ def fused_gather_attn_decode_model1(
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        # num_stages=2 configs (software pipelining)
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=2),
     ],
     key=["total_tokens", "h_q", "topk_main", "topk_extra"],
 )
@@ -596,7 +579,7 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     """
     OPTIMIZED fused gather+dequant+attention kernel for MODEL1 with dual scope.
 
-    This version uses a helper function (_process_kv_block_and_update_acc) to
+    This version uses a helper function (_process_kv_block_aggressive) to
     eliminate the ~200 lines of duplicated code between MAIN and EXTRA scope
     processing loops.
 
@@ -693,7 +676,7 @@ def _fused_gather_attn_model1_dual_scope_kernel(
 
         # Use helper function for KV processing
         acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_and_update_acc(
+            _process_kv_block_aggressive(
                 kv_block_base, nope_rope_offset, scale_base_offset,
                 valid, valid_2d,
                 q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
@@ -736,7 +719,7 @@ def _fused_gather_attn_model1_dual_scope_kernel(
 
         # Use helper function for KV processing
         acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_and_update_acc(
+            _process_kv_block_aggressive(
                 kv_block_base, nope_rope_offset, scale_base_offset,
                 valid, valid_2d,
                 q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
@@ -935,7 +918,7 @@ def _fused_gather_attn_model1_dual_scope_splitk_kernel(
         valid_2d = valid[:, None]
 
         acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_and_update_acc(
+            _process_kv_block_aggressive(
                 kv_block_base, nope_rope_offset, scale_base_offset,
                 valid, valid_2d,
                 q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
@@ -978,7 +961,7 @@ def _fused_gather_attn_model1_dual_scope_splitk_kernel(
         valid_2d = valid[:, None]
 
         acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_and_update_acc(
+            _process_kv_block_aggressive(
                 kv_block_base, nope_rope_offset, scale_base_offset,
                 valid, valid_2d,
                 q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
