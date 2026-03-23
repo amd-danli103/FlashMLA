@@ -187,7 +187,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -199,7 +199,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -211,7 +211,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -223,7 +223,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -235,7 +235,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -247,7 +247,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -259,7 +259,7 @@ def _gather_dequant_model1_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -276,7 +276,7 @@ def _gather_dequant_model1_kernel(
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
+    rope_bf16 = tl.where(is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
@@ -392,7 +392,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -404,7 +404,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -416,7 +416,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -428,7 +428,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -440,7 +440,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -452,7 +452,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -464,7 +464,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -481,7 +481,7 @@ def _gather_dequant_model1_kernel_fixed_128(
 
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
+    rope_bf16 = tl.where(is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
@@ -702,7 +702,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_0[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -714,7 +714,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_1[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -726,7 +726,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_2[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -738,7 +738,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_3[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -750,7 +750,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_4[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -762,7 +762,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_5[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -774,7 +774,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
     dequant = nope_bf16 * scale_bf16_6[:, None]
-    dequant = tl.where((dequant != dequant) | is_invalid_2d, 0.0,
+    dequant = tl.where(is_invalid_2d, 0.0,
                        tl.maximum(tl.minimum(dequant, 65504.0), -65504.0))
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
@@ -788,7 +788,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     rope_hi = tl.load(rope_hi_ptrs, mask=valid_mask_2d, other=0).to(tl.uint16)
     rope_uint16 = rope_lo | (rope_hi << 8)
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
-    rope_bf16 = tl.where((rope_bf16 != rope_bf16) | is_invalid_2d, 0.0,
+    rope_bf16 = tl.where(is_invalid_2d, 0.0,
                          tl.maximum(tl.minimum(rope_bf16, 65504.0), -65504.0))
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
     tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
