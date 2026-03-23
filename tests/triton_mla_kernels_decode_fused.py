@@ -1799,3 +1799,231 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
         return 4
     else:
         return 2
+
+
+# ============================================================================
+# Low-overhead buffer pool for splitk operations
+# ============================================================================
+class SplitKBufferPool:
+    """
+    Pre-allocated buffer pool for split-K intermediate tensors.
+
+    Caches partial_output and partial_lse buffers to avoid repeated allocations.
+    Output buffers are always freshly allocated to ensure correctness.
+    """
+    _buffers = {}
+    _device = None
+
+    @classmethod
+    def get_buffers(cls, split_k: int, total_tokens: int, h_q: int, d_v: int, device: torch.device):
+        """Get or create intermediate buffers for the given configuration."""
+        key = (split_k, total_tokens, h_q, d_v, device)
+
+        if key not in cls._buffers or cls._device != device:
+            cls._device = device
+            partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+            partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
+
+            cls._buffers[key] = {
+                'partial_output': partial_output,
+                'partial_lse': partial_lse,
+                'stride_po': partial_output.stride(),
+                'stride_plse': partial_lse.stride(),
+            }
+
+        return cls._buffers[key]
+
+    @classmethod
+    def clear(cls):
+        """Clear all cached buffers."""
+        cls._buffers.clear()
+        cls._device = None
+
+
+def fused_gather_attn_decode_model1_dual_scope_low_overhead(
+    q: torch.Tensor,
+    kv_cache_main: torch.Tensor,
+    indices_main: torch.Tensor,
+    block_size_main: int,
+    kv_cache_extra: torch.Tensor,
+    indices_extra: torch.Tensor,
+    block_size_extra: int,
+    sm_scale: float,
+    topk_length_main: Optional[torch.Tensor] = None,
+    topk_length_extra: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    s_q: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Low-overhead version of fused_gather_attn_decode_model1_dual_scope.
+
+    This version uses pre-allocated intermediate buffers and cached strides
+    to minimize Python overhead, which is significant for small batch sizes.
+
+    The kernel computation is identical to the original version.
+    Output buffers are always freshly allocated to ensure correctness.
+    """
+    total_tokens, h_q, d_qk = q.shape
+    topk_main = indices_main.shape[1]
+    topk_extra = indices_extra.shape[1]
+    total_topk = topk_main + topk_extra
+    d_v = MODEL1_D_V
+    device = q.device
+
+    # Prepare main KV cache
+    kv_uint8_main = kv_cache_main.view(torch.uint8)
+    num_blocks_main = kv_cache_main.shape[0]
+    stride_kv_block_main = kv_uint8_main.stride(0)
+    kv_flat_main = kv_uint8_main.reshape(num_blocks_main, -1)
+
+    # Prepare extra KV cache
+    kv_uint8_extra = kv_cache_extra.view(torch.uint8)
+    num_blocks_extra = kv_cache_extra.shape[0]
+    stride_kv_block_extra = kv_uint8_extra.stride(0)
+    kv_flat_extra = kv_uint8_extra.reshape(num_blocks_extra, -1)
+
+    if q.dtype != torch.bfloat16 or not q.is_contiguous():
+        q = q.to(torch.bfloat16).contiguous()
+
+    if not indices_main.is_contiguous():
+        indices_main = indices_main.contiguous()
+    if not indices_extra.is_contiguous():
+        indices_extra = indices_extra.contiguous()
+
+    # Determine split_k
+    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048
+    use_splitk_for_small_bs = (total_tokens <= 8 and (h_q >= 128 or total_topk >= 1024))
+    use_splitk_for_h64_large_topk = (h_q <= 64 and total_topk >= 1024 and total_tokens > 8 and total_tokens <= 128)
+    use_splitk_for_large_topk = total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD
+
+    if not (use_splitk_for_small_bs or use_splitk_for_h64_large_topk or use_splitk_for_large_topk):
+        # Fall back to non-splitk version
+        return fused_gather_attn_decode_model1_dual_scope(
+            q, kv_cache_main, indices_main, block_size_main,
+            kv_cache_extra, indices_extra, block_size_extra,
+            sm_scale, topk_length_main, topk_length_extra, attn_sink, s_q
+        )
+
+    # Select split_k
+    if total_tokens <= 8:
+        split_k = 2
+    elif use_splitk_for_h64_large_topk:
+        split_k = 2
+    else:
+        split_k = _select_split_k(total_topk, h_q, total_tokens)
+
+    topk_per_split = (total_topk + split_k - 1) // split_k
+
+    # Get pre-allocated intermediate buffers
+    buffers = SplitKBufferPool.get_buffers(split_k, total_tokens, h_q, d_v, device)
+    partial_output = buffers['partial_output']
+    partial_lse = buffers['partial_lse']
+    stride_po = buffers['stride_po']
+    stride_plse = buffers['stride_plse']
+
+    # Always allocate fresh output buffers for correctness
+    output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+
+    # Prepare dummy tensors for optional parameters
+    topk_length_main_tensor = topk_length_main if topk_length_main is not None else lse[:1, 0]
+    topk_length_extra_tensor = topk_length_extra if topk_length_extra is not None else lse[:1, 0]
+    attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
+
+    # Pre-compute strides
+    stride_q = q.stride()
+    stride_o = output.stride()
+    stride_lse = lse.stride()
+
+    # Check if buffer ops should be disabled
+    kv_cache_size_main = stride_kv_block_main * num_blocks_main
+    kv_cache_size_extra = stride_kv_block_extra * num_blocks_extra
+    disable_buffer_ops = (kv_cache_size_main > BUFFER_OPS_DISABLE_THRESHOLD or
+                          kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD)
+
+    # Grid for splitk kernel
+    grid_splitk = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens, split_k)
+
+    # Run splitk kernel
+    if disable_buffer_ops:
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_buffer_ops = False
+            _fused_gather_attn_model1_dual_scope_splitk_kernel[grid_splitk](
+                q,
+                kv_flat_main, indices_main, topk_length_main_tensor,
+                kv_flat_extra, indices_extra, topk_length_extra_tensor,
+                partial_output, partial_lse,
+                sm_scale, total_tokens, h_q,
+                topk_main, num_blocks_main, block_size_main,
+                topk_extra, num_blocks_extra, block_size_extra,
+                s_q, topk_per_split,
+                stride_q[0], stride_q[1], stride_q[2],
+                stride_kv_block_main, stride_kv_block_extra,
+                indices_main.stride(0), indices_main.stride(1),
+                indices_extra.stride(0), indices_extra.stride(1),
+                stride_po[0], stride_po[1], stride_po[2], stride_po[3],
+                stride_plse[0], stride_plse[1], stride_plse[2],
+                HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
+                HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
+            )
+    else:
+        _fused_gather_attn_model1_dual_scope_splitk_kernel[grid_splitk](
+            q,
+            kv_flat_main, indices_main, topk_length_main_tensor,
+            kv_flat_extra, indices_extra, topk_length_extra_tensor,
+            partial_output, partial_lse,
+            sm_scale, total_tokens, h_q,
+            topk_main, num_blocks_main, block_size_main,
+            topk_extra, num_blocks_extra, block_size_extra,
+            s_q, topk_per_split,
+            stride_q[0], stride_q[1], stride_q[2],
+            stride_kv_block_main, stride_kv_block_extra,
+            indices_main.stride(0), indices_main.stride(1),
+            indices_extra.stride(0), indices_extra.stride(1),
+            stride_po[0], stride_po[1], stride_po[2], stride_po[3],
+            stride_plse[0], stride_plse[1], stride_plse[2],
+            HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
+            HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
+        )
+
+    # Run combine kernel
+    if split_k == 8:
+        grid_combine = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+        _combine_splitk_kernel_8_optimized[grid_combine](
+            partial_output, partial_lse, attn_sink_tensor,
+            output, lse,
+            total_tokens, h_q, d_v,
+            stride_po[0], stride_po[1], stride_po[2], stride_po[3],
+            stride_plse[0], stride_plse[1], stride_plse[2],
+            stride_o[0], stride_o[1], stride_o[2],
+            stride_lse[0], stride_lse[1],
+            HAS_ATTN_SINK=attn_sink is not None,
+        )
+    else:
+        BLOCK_H_COMBINE = 16
+        BLOCK_D_COMBINE = 128
+        grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
+
+        if split_k == 2:
+            combine_kernel = _combine_splitk_kernel_2
+        elif split_k == 4:
+            combine_kernel = _combine_splitk_kernel
+        else:
+            raise ValueError(f"Unsupported split_k: {split_k}")
+
+        combine_kernel[grid_combine](
+            partial_output, partial_lse, attn_sink_tensor,
+            output, lse,
+            total_tokens, h_q, d_v,
+            stride_po[0], stride_po[1], stride_po[2], stride_po[3],
+            stride_plse[0], stride_plse[1], stride_plse[2],
+            stride_o[0], stride_o[1], stride_o[2],
+            stride_lse[0], stride_lse[1],
+            HAS_ATTN_SINK=attn_sink is not None,
+            BLOCK_H=BLOCK_H_COMBINE,
+            BLOCK_D=BLOCK_D_COMBINE,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    return output, lse
