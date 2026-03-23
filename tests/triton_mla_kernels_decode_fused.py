@@ -404,7 +404,7 @@ def fused_gather_attn_decode_model1(
         split_k = _select_split_k(topk, h_q, total_tokens)
         topk_per_split = (topk + split_k - 1) // split_k
 
-        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device)
         partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
         output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
         lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
@@ -979,25 +979,17 @@ def _fused_gather_attn_model1_dual_scope_splitk_kernel(
     stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
     po_base = PartialOutput + pid_k * stride_po_s_64 + pid_t_64 * stride_po_t_64
 
-    o_0 = acc_0.to(tl.bfloat16)
-    o_1 = acc_1.to(tl.bfloat16)
-    o_2 = acc_2.to(tl.bfloat16)
-    o_3 = acc_3.to(tl.bfloat16)
-    o_4 = acc_4.to(tl.bfloat16)
-    o_5 = acc_5.to(tl.bfloat16)
-    o_6 = acc_6.to(tl.bfloat16)
-    o_7 = acc_7.to(tl.bfloat16)
-
+    # Store partial output as float32 for better precision in combine kernel
     row_ptrs = po_base + offs_h[:, None] * stride_po_h
 
-    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, o_0, mask=mask_h[:, None])
-    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_1, mask=mask_h[:, None])
-    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_2, mask=mask_h[:, None])
-    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_3, mask=mask_h[:, None])
-    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_4, mask=mask_h[:, None])
-    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_5, mask=mask_h[:, None])
-    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_6, mask=mask_h[:, None])
-    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, o_7, mask=mask_h[:, None])
+    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, acc_0, mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_1, mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_2, mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_3, mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_4, mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_5, mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_6, mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_7, mask=mask_h[:, None])
 
     # Store partial LSE
     stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
@@ -1098,7 +1090,7 @@ def fused_gather_attn_decode_model1_dual_scope(
             split_k = _select_split_k(total_topk, h_q, total_tokens)
         topk_per_split = (total_topk + split_k - 1) // split_k
 
-        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+        partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device)
         partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
         output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
         lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
@@ -1363,14 +1355,15 @@ def _fused_gather_attn_model1_splitk_kernel(
     po_base = PartialOutput + pid_k * stride_po_s_64 + pid_t_64 * stride_po_t_64
     row_ptrs = po_base + offs_h[:, None] * stride_po_h
 
-    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_1.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_2.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_4.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_5.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_6.to(tl.bfloat16), mask=mask_h[:, None])
-    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_7.to(tl.bfloat16), mask=mask_h[:, None])
+    # Store partial output as float32 for better precision in combine kernel
+    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, acc_0, mask=mask_h[:, None])
+    tl.store(row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_1, mask=mask_h[:, None])
+    tl.store(row_ptrs + (2*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_2, mask=mask_h[:, None])
+    tl.store(row_ptrs + (3*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_3, mask=mask_h[:, None])
+    tl.store(row_ptrs + (4*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_4, mask=mask_h[:, None])
+    tl.store(row_ptrs + (5*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_5, mask=mask_h[:, None])
+    tl.store(row_ptrs + (6*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_6, mask=mask_h[:, None])
+    tl.store(row_ptrs + (7*TILE_SIZE + offs_tile[None, :]) * stride_po_d, acc_7, mask=mask_h[:, None])
 
     stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
     stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
@@ -1821,7 +1814,7 @@ class SplitKBufferPool:
 
         if key not in cls._buffers or cls._device != device:
             cls._device = device
-            partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
+            partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device)
             partial_lse = torch.empty(split_k, total_tokens, h_q, dtype=torch.float32, device=device)
 
             cls._buffers[key] = {
