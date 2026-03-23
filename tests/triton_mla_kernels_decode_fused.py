@@ -346,18 +346,6 @@ def _fused_gather_attn_model1_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
-def _get_block_n(topk: int) -> int:
-    """Select BLOCK_N based on topk size."""
-    if topk <= 64:
-        return 64
-    elif topk <= 128:
-        return 128
-    elif topk <= 256:
-        return 256
-    else:
-        return 256
-
-
 # Threshold for disabling AMD buffer_ops optimization
 # When KV cache size exceeds INT32_MAX, buffer_ops can cause int32 overflow
 # INT32_MAX = 2^31 - 1 = 2,147,483,647 bytes (~2GB)
@@ -785,7 +773,6 @@ def _fused_gather_attn_model1_dual_scope_kernel(
 
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
     tl.store(lse_ptrs, lse, mask=mask_h)
-
 
 
 # ============================================================================
@@ -1216,7 +1203,6 @@ def fused_gather_attn_decode_model1_dual_scope(
     return output, lse
 
 
-
 # ============================================================================
 # Split-K Optimization for Large TopK (>= 8192)
 # ============================================================================
@@ -1329,99 +1315,17 @@ def _fused_gather_attn_model1_splitk_kernel(
 
         valid_2d = valid[:, None]
 
-        scale_ptrs = kv_block_base + scale_base_offset
-        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
-        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
-
-        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
-        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
-
-        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
-
-        # Batch load all tiles first for better memory efficiency
-        nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_1 = tl.load(tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_2 = tl.load(tile_base + 2*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_3 = tl.load(tile_base + 3*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_4 = tl.load(tile_base + 4*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_5 = tl.load(tile_base + 5*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        nope_uint8_6 = tl.load(tile_base + 6*TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
-        rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-        rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-        rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
-
-        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
-
-        nope_fp8_0 = nope_uint8_0.to(tl.float8e4nv, bitcast=True)
-        kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-        kv_0 = tl.where(valid_2d, kv_0, 0.0)
-        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
-
-        nope_fp8_1 = nope_uint8_1.to(tl.float8e4nv, bitcast=True)
-        kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-        kv_1 = tl.where(valid_2d, kv_1, 0.0)
-        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
-
-        nope_fp8_2 = nope_uint8_2.to(tl.float8e4nv, bitcast=True)
-        kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-        kv_2 = tl.where(valid_2d, kv_2, 0.0)
-        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
-
-        nope_fp8_3 = nope_uint8_3.to(tl.float8e4nv, bitcast=True)
-        kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-        kv_3 = tl.where(valid_2d, kv_3, 0.0)
-        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
-
-        nope_fp8_4 = nope_uint8_4.to(tl.float8e4nv, bitcast=True)
-        kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-        kv_4 = tl.where(valid_2d, kv_4, 0.0)
-        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
-
-        nope_fp8_5 = nope_uint8_5.to(tl.float8e4nv, bitcast=True)
-        kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-        kv_5 = tl.where(valid_2d, kv_5, 0.0)
-        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
-
-        nope_fp8_6 = nope_uint8_6.to(tl.float8e4nv, bitcast=True)
-        kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-        kv_6 = tl.where(valid_2d, kv_6, 0.0)
-        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
-
-        kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
-        kv_7 = tl.where(valid_2d, kv_7, 0.0)
-        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
-
-        qk = qk * sm_scale
-        qk = tl.where(valid[None, :], qk, NEG_INF)
-
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.where(m_i == NEG_INF, 0.0, tl.math.exp2((m_i - m_new) * LOG2E))
-        p = tl.where(qk == NEG_INF, 0.0, tl.math.exp2((qk - m_new[:, None]) * LOG2E))
-        l_new = alpha * l_i + tl.sum(p, axis=1)
-        p_bf16 = p.to(tl.bfloat16)
-
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-        acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-        acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-        acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-        acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
-
-        m_i = m_new
-        l_i = l_new
+        # Use helper function for KV processing
+        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+            _process_kv_block_aggressive(
+                kv_block_base, nope_rope_offset, scale_base_offset,
+                valid, valid_2d,
+                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                m_i, l_i,
+                offs_tile, sm_scale,
+                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+            )
 
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = (l_i == 0.0)
@@ -1566,159 +1470,6 @@ def _combine_splitk_kernel(
     stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
     lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
     tl.store(lse_ptrs, combined_lse, mask=mask_h)
-
-
-@triton.jit
-def _combine_splitk_kernel_8(
-    PartialOutput, PartialLSE, AttnSink,
-    Output, LSE,
-    total_tokens, h_q, d_v,
-    stride_po_s, stride_po_t, stride_po_h, stride_po_d,
-    stride_plse_s, stride_plse_t, stride_plse_h,
-    stride_o_t, stride_o_h, stride_o_d,
-    stride_lse_t, stride_lse_h,
-    HAS_ATTN_SINK: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Combine partial results from split-K kernel (SPLIT_K=8)."""
-    LOG2E: tl.constexpr = 1.4426950408889634
-    NEG_INF = float("-inf")
-    POS_INF = float("+inf")
-    INF_THRESHOLD = 1e30
-
-    pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_t_64 = pid_t.to(tl.int64)
-
-    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = offs_h < h_q
-    offs_d = tl.arange(0, BLOCK_D)
-
-    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
-    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
-
-    # Load all 8 LSE values
-    lse_0 = tl.load(PartialLSE + 0 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_1 = tl.load(PartialLSE + 1 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_2 = tl.load(PartialLSE + 2 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_3 = tl.load(PartialLSE + 3 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_4 = tl.load(PartialLSE + 4 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_5 = tl.load(PartialLSE + 5 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_6 = tl.load(PartialLSE + 6 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-    lse_7 = tl.load(PartialLSE + 7 * stride_plse_s_64 + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h, mask=mask_h, other=POS_INF)
-
-    lse_0_valid = tl.abs(lse_0) < INF_THRESHOLD
-    lse_1_valid = tl.abs(lse_1) < INF_THRESHOLD
-    lse_2_valid = tl.abs(lse_2) < INF_THRESHOLD
-    lse_3_valid = tl.abs(lse_3) < INF_THRESHOLD
-    lse_4_valid = tl.abs(lse_4) < INF_THRESHOLD
-    lse_5_valid = tl.abs(lse_5) < INF_THRESHOLD
-    lse_6_valid = tl.abs(lse_6) < INF_THRESHOLD
-    lse_7_valid = tl.abs(lse_7) < INF_THRESHOLD
-
-    lse_0_safe = tl.where(lse_0_valid, lse_0, NEG_INF)
-    lse_1_safe = tl.where(lse_1_valid, lse_1, NEG_INF)
-    lse_2_safe = tl.where(lse_2_valid, lse_2, NEG_INF)
-    lse_3_safe = tl.where(lse_3_valid, lse_3, NEG_INF)
-    lse_4_safe = tl.where(lse_4_valid, lse_4, NEG_INF)
-    lse_5_safe = tl.where(lse_5_valid, lse_5, NEG_INF)
-    lse_6_safe = tl.where(lse_6_valid, lse_6, NEG_INF)
-    lse_7_safe = tl.where(lse_7_valid, lse_7, NEG_INF)
-
-    max_lse = tl.maximum(tl.maximum(tl.maximum(lse_0_safe, lse_1_safe), tl.maximum(lse_2_safe, lse_3_safe)),
-                         tl.maximum(tl.maximum(lse_4_safe, lse_5_safe), tl.maximum(lse_6_safe, lse_7_safe)))
-
-    exp_0 = tl.where(lse_0_valid, tl.math.exp2((lse_0_safe - max_lse) * LOG2E), 0.0)
-    exp_1 = tl.where(lse_1_valid, tl.math.exp2((lse_1_safe - max_lse) * LOG2E), 0.0)
-    exp_2 = tl.where(lse_2_valid, tl.math.exp2((lse_2_safe - max_lse) * LOG2E), 0.0)
-    exp_3 = tl.where(lse_3_valid, tl.math.exp2((lse_3_safe - max_lse) * LOG2E), 0.0)
-    exp_4 = tl.where(lse_4_valid, tl.math.exp2((lse_4_safe - max_lse) * LOG2E), 0.0)
-    exp_5 = tl.where(lse_5_valid, tl.math.exp2((lse_5_safe - max_lse) * LOG2E), 0.0)
-    exp_6 = tl.where(lse_6_valid, tl.math.exp2((lse_6_safe - max_lse) * LOG2E), 0.0)
-    exp_7 = tl.where(lse_7_valid, tl.math.exp2((lse_7_safe - max_lse) * LOG2E), 0.0)
-
-    sum_exp = exp_0 + exp_1 + exp_2 + exp_3 + exp_4 + exp_5 + exp_6 + exp_7
-    all_invalid = sum_exp == 0.0
-    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
-
-    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
-    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
-
-    if HAS_ATTN_SINK:
-        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
-        is_lonely = combined_lse > INF_THRESHOLD
-        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
-        diff = attn_sink_vals - lse_safe_for_sink
-        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
-        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
-        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
-        denominator = 1.0 + exp_diff
-        sink_scale = 1.0 / denominator
-        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
-
-        scale_0 = (exp_0 / sum_exp_safe) * sink_scale
-        scale_1 = (exp_1 / sum_exp_safe) * sink_scale
-        scale_2 = (exp_2 / sum_exp_safe) * sink_scale
-        scale_3 = (exp_3 / sum_exp_safe) * sink_scale
-        scale_4 = (exp_4 / sum_exp_safe) * sink_scale
-        scale_5 = (exp_5 / sum_exp_safe) * sink_scale
-        scale_6 = (exp_6 / sum_exp_safe) * sink_scale
-        scale_7 = (exp_7 / sum_exp_safe) * sink_scale
-    else:
-        scale_0 = exp_0 / sum_exp_safe
-        scale_1 = exp_1 / sum_exp_safe
-        scale_2 = exp_2 / sum_exp_safe
-        scale_3 = exp_3 / sum_exp_safe
-        scale_4 = exp_4 / sum_exp_safe
-        scale_5 = exp_5 / sum_exp_safe
-        scale_6 = exp_6 / sum_exp_safe
-        scale_7 = exp_7 / sum_exp_safe
-
-    scale_0 = tl.where(all_invalid, 0.0, scale_0)
-    scale_1 = tl.where(all_invalid, 0.0, scale_1)
-    scale_2 = tl.where(all_invalid, 0.0, scale_2)
-    scale_3 = tl.where(all_invalid, 0.0, scale_3)
-    scale_4 = tl.where(all_invalid, 0.0, scale_4)
-    scale_5 = tl.where(all_invalid, 0.0, scale_5)
-    scale_6 = tl.where(all_invalid, 0.0, scale_6)
-    scale_7 = tl.where(all_invalid, 0.0, scale_7)
-
-    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
-    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
-
-    po_base_0 = PartialOutput + 0 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_1 = PartialOutput + 1 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_2 = PartialOutput + 2 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_3 = PartialOutput + 3 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_4 = PartialOutput + 4 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_5 = PartialOutput + 5 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_6 = PartialOutput + 6 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-    po_base_7 = PartialOutput + 7 * stride_po_s_64 + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
-
-    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
-    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
-
-    for d_idx in range(4):
-        d_offs = d_idx * BLOCK_D + offs_d[None, :]
-        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_2 = tl.load(po_base_2 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_3 = tl.load(po_base_3 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_4 = tl.load(po_base_4 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_5 = tl.load(po_base_5 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_6 = tl.load(po_base_6 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        po_7 = tl.load(po_base_7 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0)
-        combined = (scale_0[:, None] * po_0 + scale_1[:, None] * po_1 +
-                   scale_2[:, None] * po_2 + scale_3[:, None] * po_3 +
-                   scale_4[:, None] * po_4 + scale_5[:, None] * po_5 +
-                   scale_6[:, None] * po_6 + scale_7[:, None] * po_7)
-        tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_h[:, None])
-
-    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
-    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
-    tl.store(lse_ptrs, combined_lse, mask=mask_h)
-
 
 
 @triton.autotune(
