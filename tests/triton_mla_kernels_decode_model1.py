@@ -163,7 +163,7 @@ def _gather_dequant_model1_kernel(
     scale_uint8_5 = tl.load(scale_ptrs_5, mask=valid_mask, other=127).to(tl.uint8)
     scale_uint8_6 = tl.load(scale_ptrs_6, mask=valid_mask, other=127).to(tl.uint8)
 
-    # Convert all scales to bf16
+    # Convert all scales to bf16 and pre-compute 2D versions
     scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
@@ -171,6 +171,14 @@ def _gather_dequant_model1_kernel(
     scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+    # Pre-compute 2D versions for tile processing
+    scale_2d_0 = scale_bf16_0[:, None]
+    scale_2d_1 = scale_bf16_1[:, None]
+    scale_2d_2 = scale_bf16_2[:, None]
+    scale_2d_3 = scale_bf16_3[:, None]
+    scale_2d_4 = scale_bf16_4[:, None]
+    scale_2d_5 = scale_bf16_5[:, None]
+    scale_2d_6 = scale_bf16_6[:, None]
 
     offs_d = tl.arange(0, TILE_SIZE)
 
@@ -186,7 +194,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_0[:, None]
+    dequant = nope_bf16 * scale_2d_0
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -197,7 +205,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_1[:, None]
+    dequant = nope_bf16 * scale_2d_1
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -208,7 +216,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_2[:, None]
+    dequant = nope_bf16 * scale_2d_2
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -219,7 +227,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_3[:, None]
+    dequant = nope_bf16 * scale_2d_3
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -230,7 +238,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_4[:, None]
+    dequant = nope_bf16 * scale_2d_4
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -241,7 +249,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_5[:, None]
+    dequant = nope_bf16 * scale_2d_5
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -252,7 +260,7 @@ def _gather_dequant_model1_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_6[:, None]
+    dequant = nope_bf16 * scale_2d_6
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -360,7 +368,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     scale_uint8_5 = tl.load(scale_ptrs_5, mask=valid_mask, other=127).to(tl.uint8)
     scale_uint8_6 = tl.load(scale_ptrs_6, mask=valid_mask, other=127).to(tl.uint8)
 
-    # Convert all scales to bf16
+    # Convert all scales to bf16 and pre-compute 2D versions
     scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
@@ -368,6 +376,14 @@ def _gather_dequant_model1_kernel_fixed_128(
     scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+    # Pre-compute 2D versions for tile processing
+    scale_2d_0 = scale_bf16_0[:, None]
+    scale_2d_1 = scale_bf16_1[:, None]
+    scale_2d_2 = scale_bf16_2[:, None]
+    scale_2d_3 = scale_bf16_3[:, None]
+    scale_2d_4 = scale_bf16_4[:, None]
+    scale_2d_5 = scale_bf16_5[:, None]
+    scale_2d_6 = scale_bf16_6[:, None]
 
     offs_d = tl.arange(0, TILE_SIZE)
 
@@ -383,7 +399,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_0[:, None]
+    dequant = nope_bf16 * scale_2d_0
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -394,7 +410,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_1[:, None]
+    dequant = nope_bf16 * scale_2d_1
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -405,7 +421,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_2[:, None]
+    dequant = nope_bf16 * scale_2d_2
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -416,7 +432,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_3[:, None]
+    dequant = nope_bf16 * scale_2d_3
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -427,7 +443,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_4[:, None]
+    dequant = nope_bf16 * scale_2d_4
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -438,7 +454,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_5[:, None]
+    dequant = nope_bf16 * scale_2d_5
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -449,7 +465,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_6[:, None]
+    dequant = nope_bf16 * scale_2d_6
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -670,6 +686,14 @@ def _gather_dequant_model1_1d_fused_kernel(
     scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
     scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+    # Pre-compute 2D versions for tile processing
+    scale_2d_0 = scale_bf16_0[:, None]
+    scale_2d_1 = scale_bf16_1[:, None]
+    scale_2d_2 = scale_bf16_2[:, None]
+    scale_2d_3 = scale_bf16_3[:, None]
+    scale_2d_4 = scale_bf16_4[:, None]
+    scale_2d_5 = scale_bf16_5[:, None]
+    scale_2d_6 = scale_bf16_6[:, None]
 
     offs_d = tl.arange(0, TILE_SIZE)
 
@@ -685,7 +709,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_0[:, None]
+    dequant = nope_bf16 * scale_2d_0
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -696,7 +720,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_1[:, None]
+    dequant = nope_bf16 * scale_2d_1
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -707,7 +731,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_2[:, None]
+    dequant = nope_bf16 * scale_2d_2
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -718,7 +742,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_3[:, None]
+    dequant = nope_bf16 * scale_2d_3
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -729,7 +753,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_4[:, None]
+    dequant = nope_bf16 * scale_2d_4
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -740,7 +764,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_5[:, None]
+    dequant = nope_bf16 * scale_2d_5
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)
@@ -751,7 +775,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     nope_uint8 = tl.load(nope_ptrs, mask=valid_mask_2d, other=0)
     nope_fp8 = nope_uint8.to(tl.float8e4nv, bitcast=True)
     nope_bf16 = nope_fp8.to(tl.bfloat16)
-    dequant = nope_bf16 * scale_bf16_6[:, None]
+    dequant = nope_bf16 * scale_2d_6
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
     tl.store(out_ptrs, dequant, mask=mask_tk_2d)

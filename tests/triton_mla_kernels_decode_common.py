@@ -188,10 +188,13 @@ def _unified_sparse_decode_kernel(
     else:
         output_scale = tl.where(l_i == 0.0, 0.0, 1.0 / l_i)
 
-    acc_0 = tl.where(is_lonely_q[:, None], 0.0, acc_0 * output_scale[:, None])
-    acc_1 = tl.where(is_lonely_q[:, None], 0.0, acc_1 * output_scale[:, None])
-    acc_2 = tl.where(is_lonely_q[:, None], 0.0, acc_2 * output_scale[:, None])
-    acc_3 = tl.where(is_lonely_q[:, None], 0.0, acc_3 * output_scale[:, None])
+    # Pre-compute 2D versions for efficiency
+    is_lonely_q_2d = is_lonely_q[:, None]
+    output_scale_2d = output_scale[:, None]
+    acc_0 = tl.where(is_lonely_q_2d, 0.0, acc_0 * output_scale_2d)
+    acc_1 = tl.where(is_lonely_q_2d, 0.0, acc_1 * output_scale_2d)
+    acc_2 = tl.where(is_lonely_q_2d, 0.0, acc_2 * output_scale_2d)
+    acc_3 = tl.where(is_lonely_q_2d, 0.0, acc_3 * output_scale_2d)
     lse = tl.where(is_lonely_q, POS_INF, lse)
 
     stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
@@ -199,14 +202,17 @@ def _unified_sparse_decode_kernel(
 
     stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
     o_base = Output + pid_t_64 * stride_o_t_64
-    offs_v = tl.arange(0, BLOCK_D)
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h[:, None])
-    offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_1.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
-    offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_2.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
-    offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
-    tl.store(o_base + offs_h[:, None] * stride_o_h + offs_v[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h[:, None] & (offs_v[None, :] < d_v))
+    # Pre-compute 2D versions
+    offs_h_2d = offs_h[:, None]
+    mask_h_2d = mask_h[:, None]
+    offs_v_0 = tl.arange(0, BLOCK_D)
+    offs_v_1 = BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_v_2 = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_v_3 = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
+    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_0[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h_2d)
+    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_1[None, :] * stride_o_d, acc_1.to(tl.bfloat16), mask=mask_h_2d & (offs_v_1[None, :] < d_v))
+    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_2[None, :] * stride_o_d, acc_2.to(tl.bfloat16), mask=mask_h_2d & (offs_v_2[None, :] < d_v))
+    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_3[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h_2d & (offs_v_3[None, :] < d_v))
 # ============================================================================
 # Attention Runner Functions
 # ============================================================================
