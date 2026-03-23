@@ -1074,11 +1074,28 @@ def fused_gather_attn_decode_model1_dual_scope(
     disable_buffer_ops = (kv_cache_size_main > BUFFER_OPS_DISABLE_THRESHOLD or
                           kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD)
 
-    # Use Split-K for dual scope when total_tokens > 64 AND total_topk >= threshold
-    # For small topk, non-splitk kernel is more efficient due to lower overhead
-    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048  # Only use splitk for larger topk
-    if total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD:
-        split_k = _select_split_k(total_topk, h_q, total_tokens)
+    # Use Split-K for dual scope in these cases:
+    # 1. Small batch sizes with h_q=128 or large topk to increase GPU parallelism
+    # 2. Large topk (>= 2048) with medium/large batch sizes
+    # 3. NEW: h_q=64 + large topk (>=1024) + medium batch sizes (~21% improvement)
+    SPLITK_DUAL_SCOPE_TOPK_THRESHOLD = 2048
+    # For small bs, only use splitk when h_q=128 or total_topk >= 1024
+    use_splitk_for_small_bs = (total_tokens <= 8 and
+                               (h_q >= 128 or total_topk >= 1024))
+    # NEW: For h_q=64 with large topk, splitk is beneficial for medium batch sizes
+    # Only for tokens <= 128 based on benchmarking (bs=64 shows 13% improvement)
+    use_splitk_for_h64_large_topk = (h_q <= 64 and total_topk >= 1024 and
+                                      total_tokens > 8 and total_tokens <= 128)
+    use_splitk_for_large_topk = total_tokens > 64 and total_topk >= SPLITK_DUAL_SCOPE_TOPK_THRESHOLD
+    if use_splitk_for_small_bs or use_splitk_for_h64_large_topk or use_splitk_for_large_topk:
+        # Select split_k based on workload
+        if total_tokens <= 8:
+            split_k = 2
+        elif use_splitk_for_h64_large_topk:
+            # For h_q=64 + large topk + medium bs, split_k=2 is optimal
+            split_k = 2
+        else:
+            split_k = _select_split_k(total_topk, h_q, total_tokens)
         topk_per_split = (total_topk + split_k - 1) // split_k
 
         partial_output = torch.empty(split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
