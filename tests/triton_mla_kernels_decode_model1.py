@@ -53,7 +53,12 @@ MODEL1_USE_FIXED_KERNEL_THRESHOLD = 32768
 
 @triton.autotune(
     configs=[
+        # Small block sizes for better occupancy on CDNA4 (256 CUs)
+        triton.Config({'BLOCK_TK': 8}, num_warps=1, num_stages=1),
+        triton.Config({'BLOCK_TK': 8}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 16}, num_warps=1, num_stages=1),
         triton.Config({'BLOCK_TK': 16}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_TK': 16}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=2, num_stages=1),
         triton.Config({'BLOCK_TK': 32}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_TK': 64}, num_warps=4, num_stages=1),
