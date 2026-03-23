@@ -189,7 +189,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_0[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
@@ -200,7 +200,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_1[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
@@ -211,7 +211,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_2[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
@@ -222,7 +222,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_3[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
@@ -233,7 +233,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_4[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
@@ -244,7 +244,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_5[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
@@ -255,7 +255,7 @@ def _gather_dequant_model1_kernel(
     dequant = nope_bf16 * scale_bf16_6[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
@@ -272,7 +272,7 @@ def _gather_dequant_model1_kernel(
     rope_bf16 = tl.where(is_invalid_2d, 0.0, rope_bf16)
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, rope_bf16, mask=mask_tk_2d)
 
 
 @triton.jit
@@ -386,7 +386,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_0[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
@@ -397,7 +397,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_1[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
@@ -408,7 +408,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_2[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
@@ -419,7 +419,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_3[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
@@ -430,7 +430,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_4[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
@@ -441,7 +441,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_5[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
@@ -452,7 +452,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     dequant = nope_bf16 * scale_bf16_6[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
@@ -469,7 +469,7 @@ def _gather_dequant_model1_kernel_fixed_128(
     rope_bf16 = tl.where(is_invalid_2d, 0.0, rope_bf16)
 
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, rope_bf16, mask=mask_tk_2d)
 
 
 # ============================================================================
@@ -688,7 +688,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_0[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + offs_d[None, :] * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 1
     tile_start_1 = TILE_SIZE
@@ -699,7 +699,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_1[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_1 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 2
     tile_start_2 = 2 * TILE_SIZE
@@ -710,7 +710,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_2[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_2 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 3
     tile_start_3 = 3 * TILE_SIZE
@@ -721,7 +721,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_3[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_3 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 4
     tile_start_4 = 4 * TILE_SIZE
@@ -732,7 +732,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_4[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_4 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 5
     tile_start_5 = 5 * TILE_SIZE
@@ -743,7 +743,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_5[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_5 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process tile 6
     tile_start_6 = 6 * TILE_SIZE
@@ -754,7 +754,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     dequant = nope_bf16 * scale_bf16_6[:, None]
     dequant = tl.where(is_invalid_2d, 0.0, dequant)
     out_ptrs = out_base + (tile_start_6 + offs_d[None, :]) * stride_out_d
-    tl.store(out_ptrs, dequant.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, dequant, mask=mask_tk_2d)
 
     # Process rope
     offs_rope = tl.arange(0, D_ROPE)
@@ -767,7 +767,7 @@ def _gather_dequant_model1_1d_fused_kernel(
     rope_bf16 = rope_uint16.to(tl.bfloat16, bitcast=True)
     rope_bf16 = tl.where(is_invalid_2d, 0.0, rope_bf16)
     out_ptrs = out_base + (D_NOPE + offs_rope[None, :]) * stride_out_d
-    tl.store(out_ptrs, rope_bf16.to(tl.bfloat16), mask=mask_tk_2d)
+    tl.store(out_ptrs, rope_bf16, mask=mask_tk_2d)
 
 
 

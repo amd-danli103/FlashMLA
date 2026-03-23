@@ -141,7 +141,7 @@ def _unified_sparse_decode_kernel(
             k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
             k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
 
-            qk += tl.dot(q_chunk, tl.trans(k_chunk)).to(tl.float32)
+            qk += tl.dot(q_chunk, tl.trans(k_chunk))
 
         qk = qk * sm_scale
         qk = tl.where(valid[None, :], qk, NEG_INF)
@@ -156,22 +156,22 @@ def _unified_sparse_decode_kernel(
         offs_v = tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
-        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+        acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, v)
 
         offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+        acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v)
 
         offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+        acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v)
 
         offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
         v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
-        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v).to(tl.float32)
+        acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v)
 
         m_i = m_new
         l_i = l_new
