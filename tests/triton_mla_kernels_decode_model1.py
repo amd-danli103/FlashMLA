@@ -12,6 +12,7 @@ import triton.language as tl
 from typing import Optional, Tuple
 
 from triton_mla_kernels_decode_common import (
+    run_splitk_unified_attention,
     _get_workload_size_category,
     run_unified_attention,
     run_chunked_attention_triton,
@@ -1084,7 +1085,16 @@ def _triton_sparse_attn_decode_model1_impl(
     if not q_reshaped.is_contiguous():
         q_reshaped = q_reshaped.contiguous()
 
-    if total_topk <= 65536:
+
+    # Use splitk for large topk to reduce register pressure
+    if total_topk >= 8192:
+        split_k = 2
+        output, lse = run_splitk_unified_attention(
+            q_reshaped, gathered_kv, invalid_mask,
+            d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+            attn_sink=attn_sink, split_k=split_k
+        )
+    elif total_topk <= 65536:
         output, lse = run_unified_attention(
             q_reshaped, gathered_kv, invalid_mask,
             d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,

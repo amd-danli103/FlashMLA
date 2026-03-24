@@ -396,3 +396,18 @@ def compute_token_ranges(total_tokens: int, total_topk: int, d_qk: int,
     return token_ranges
 
 
+
+
+# ============================================================================
+# Split-K Attention for Large TopK
+# ============================================================================
+def run_splitk_unified_attention(q_reshaped, gathered_kv, invalid_mask,
+                                  d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+                                  attn_sink=None, split_k=4):
+    """Run split-K attention for large topk cases."""
+    from triton_mla_kernels_decode_splitk import run_splitk_attention
+    return run_splitk_attention(
+        q_reshaped, gathered_kv, invalid_mask,
+        d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
+        attn_sink=attn_sink, split_k=split_k
+    )
