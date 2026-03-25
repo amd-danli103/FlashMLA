@@ -1088,7 +1088,12 @@ def _triton_sparse_attn_decode_model1_impl(
 
     # Use splitk for large topk to reduce register pressure
     if total_topk >= 8192:
-        split_k = 2
+        # Adaptive split_k selection for optimal performance
+        # split_k=3 is optimal for topk >= 16384 based on benchmarking
+        if total_topk >= 16384:
+            split_k = 3
+        else:
+            split_k = 2
         output, lse = run_splitk_unified_attention(
             q_reshaped, gathered_kv, invalid_mask,
             d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
