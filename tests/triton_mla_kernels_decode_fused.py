@@ -1221,14 +1221,32 @@ SPLITK_DEFAULT = 4
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        # Tiny BLOCK_N=8 for minimal scattered access
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 8}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 8}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 8}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 8}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 8}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 8}, num_warps=8, num_stages=1),
+        # Very small BLOCK_N=16
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 16}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 16}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=8, num_stages=1),
+        # Small BLOCK_N=32
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=8, num_stages=1),
+        # Medium BLOCK_N=64
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens", "h_q", "topk_per_split"],
 )
@@ -1762,33 +1780,12 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
     the topk dimension. Larger split_k increases parallelism but also increases
     the overhead of the combine kernel.
 
-    Heuristics (based on benchmarking on AMD MI300X):
-    - For large topk (>= 16384) with large total_tokens (>= 128): split_k=8
-    - For large topk with medium total_tokens (64-127): split_k=4 for h_q=64, split_k=8 for h_q=128
-    - For large topk with small total_tokens (<= 64): split_k=8 for h_q=64, split_k=4 for h_q=128
+    Updated heuristics based on benchmarking with optimized BLOCK_N configs:
+    - For large topk (>= 16384): split_k=4 provides good balance with existing combine kernel
     - For medium topk (8192-16383): split_k=4
     - For small topk (< 8192): split_k=2
-
-    The key insight is that optimal split_k balances:
-    1. Parallelism in K dimension (higher split_k = more parallelism)
-    2. Combine kernel overhead (higher split_k = more overhead)
-    3. GPU occupancy (total_tokens * ceil(h_q/BLOCK_H) * split_k)
-
-    Benchmark results for b=148 (total_tokens=296), topk=16384:
-    - h_q=64:  split_k=8 best (5975 us), split_k=4 (6042 us), split_k=2 (6972 us)
-    - h_q=128: split_k=8 best (11247 us), split_k=4 (11434 us), split_k=2 (11664 us)
     """
-    if topk >= 16384:
-        # For very large topk, split_k=8 is generally best for large batches
-        if total_tokens >= 128:
-            return 8
-        elif total_tokens >= 64:
-            # Medium batch: split_k=4 for h_q=64, split_k=8 for h_q=128
-            return 4 if h_q <= 64 else 8
-        else:
-            # Small batch: need more parallelism
-            return 8 if h_q <= 64 else 4
-    elif topk >= 8192:
+    if topk >= 8192:
         return 4
     else:
         return 2

@@ -21,7 +21,22 @@ from typing import Optional, Tuple
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Configs optimized for reduced register pressure with various BLOCK_N sizes
+        # num_stages=2 configs for software pipelining
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        # num_stages=1 baseline configs
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
@@ -31,7 +46,6 @@ from typing import Optional, Tuple
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        # num_warps=8 configs
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
@@ -40,7 +54,6 @@ from typing import Optional, Tuple
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        # Smaller BLOCK_H for better occupancy
         triton.Config({"BLOCK_H": 8, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 8, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
     ],
