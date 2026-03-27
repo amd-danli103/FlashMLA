@@ -86,23 +86,20 @@ def _triton_sparse_attn_decode_model1(
 
     # Single scope case
     if extra_kv_scope is None:
-        if topk_main < 8192:
-            q_reshaped = q.reshape(total_tokens, h_q, d_qk)
-            if not q_reshaped.is_contiguous():
-                q_reshaped = q_reshaped.contiguous()
+        # Use fused kernel for all topk values (it has Split-K for large topk)
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
+        if not q_reshaped.is_contiguous():
+            q_reshaped = q_reshaped.contiguous()
 
-            indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-            if not indices_main.is_contiguous():
-                indices_main = indices_main.contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
+        if not indices_main.is_contiguous():
+            indices_main = indices_main.contiguous()
 
-            output, lse = fused_gather_attn_decode_model1(
-                q_reshaped, kv_quantized_main, indices_main, block_size_main,
-                sm_scale, topk_length=kv_scope.topk_length, attn_sink=attn_sink, s_q=s_q,
-            )
-            return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
-        else:
-            from triton_mla_kernels_decode_model1 import triton_sparse_attn_decode_model1
-            return triton_sparse_attn_decode_model1(q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink)
+        output, lse = fused_gather_attn_decode_model1(
+            q_reshaped, kv_quantized_main, indices_main, block_size_main,
+            sm_scale, topk_length=kv_scope.topk_length, attn_sink=attn_sink, s_q=s_q,
+        )
+        return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
     # Dual scope case
     topk_extra = extra_kv_scope.indices_in_kvcache.shape[-1]

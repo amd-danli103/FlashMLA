@@ -36,6 +36,9 @@ MODEL1_NUM_TILES = 7
 MODEL1_BYTES_PER_TOKEN_DATA = 576  # 448 nope + 128 rope
 MODEL1_BYTES_PER_TOKEN_SCALE = 8   # 7 scales + 1 padding
 
+# Combine kernel block size for split-K reduction
+# Smaller value (32) provides better cache efficiency than default 128
+COMBINE_BLOCK_D = 32
 
 # ============================================================================
 # Helper: Process KV block and compute QK scores + accumulator update
@@ -415,6 +418,9 @@ def fused_gather_attn_decode_model1(
         # Use autotuned grid
         grid_splitk = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens, split_k)
 
+        # ROCm-specific optimization for AMD CDNA architecture
+        extra_kargs = {"matrix_instr_nonkdim": 16}
+
         def run_splitk_kernel():
             _fused_gather_attn_model1_splitk_kernel[grid_splitk](
                 q, kv_flat, indices, topk_length_tensor,
@@ -427,6 +433,7 @@ def fused_gather_attn_decode_model1(
                 partial_output.stride(0), partial_output.stride(1), partial_output.stride(2), partial_output.stride(3),
                 partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
                 HAS_TOPK_LENGTH=topk_length is not None,
+                **extra_kargs,
             )
 
         if disable_buffer_ops:
@@ -452,7 +459,7 @@ def fused_gather_attn_decode_model1(
             )
         else:
             BLOCK_H_COMBINE = 16
-            BLOCK_D_COMBINE = 128
+            BLOCK_D_COMBINE = COMBINE_BLOCK_D
             grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
             # Select appropriate combine kernel based on split_k
@@ -1143,7 +1150,7 @@ def fused_gather_attn_decode_model1_dual_scope(
             )
         else:
             BLOCK_H_COMBINE = 16
-            BLOCK_D_COMBINE = 128
+            BLOCK_D_COMBINE = COMBINE_BLOCK_D
             grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
             if split_k == 2:
@@ -1991,7 +1998,7 @@ def fused_gather_attn_decode_model1_dual_scope_low_overhead(
         )
     else:
         BLOCK_H_COMBINE = 16
-        BLOCK_D_COMBINE = 128
+        BLOCK_D_COMBINE = COMBINE_BLOCK_D
         grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
         if split_k == 2:
