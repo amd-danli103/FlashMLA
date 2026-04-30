@@ -1,0 +1,13 @@
+diff --git a/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py b/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
+index a0da83b52..57b77e43c 100644
+--- a/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
++++ b/python/sglang/srt/layers/attention/nsa/tilelang_kernel.py
+@@ -1557,7 +1557,7 @@ def _build_fp8_combined_view(k_cache: torch.Tensor) -> Tuple[torch.Tensor, int,
+ 
+ 
+ _TOPK_LEN_SENTINEL_CACHE: dict = {}
+-_INT32_MAX = 2**31 - 1
++_INT32_MAX = 2**30  # Use 2**30 instead of 2**31-1 to avoid int32 overflow in dual-scope Phase 2
+ 
+ 
+ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:

@@ -1,0 +1,307 @@
+Loading tilelang libs from dev root: /opt/tilelang/build
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] merge tuned file under model_configs/ and configs/ /sgl-workspace/aiter/aiter/configs/bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/dsv3_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv
+/sgl-workspace/aiter/aiter/jit/core.py:214: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
+================================================================================
+ENVIRONMENT INFO
+================================================================================
+  Python:        3.10.12 (/opt/venv/bin/python3)
+  PyTorch:       2.9.1+rocm7.2.0.git7e1940d4
+  ROCm (HIP):    7.2.26015-fc0010cf6a
+  GPU:           AMD Instinct MI355X
+  GPU Arch:      gfx950 (compute capability 9.5)
+  GPU Memory:    288.0 GB
+  Triton:        3.6.0
+  TileLang:      0.1.7.post3+cuda.gita55a8230
+  VISIBLE_DEVS:  (not set)
+  Hostname:      smci355-ccs-aus-m11-25
+  Date:          2026-04-30 09:53:47
+================================================================================
+
+================================================================================
+Sparse MLA Decode: Triton vs TileLang Native
+================================================================================
+Total test cases: 26
+Benchmark runs: 20, Warmup: 5
+================================================================================
+
+======================================================================
+[1/26] CFG1: b=2, h_q=64, topk=128, extra_topk=512, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      147.2 us     2.3 TF  [PASS]
+  TileLang:    374.9 us     0.9 TF  [PASS]
+  Ref:         239.7 us     1.4 TF
+
+======================================================================
+[2/26] CFG1: b=64, h_q=64, topk=128, extra_topk=512, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      133.9 us    80.2 TF  [PASS]
+  TileLang:    378.4 us    28.4 TF  [PASS]
+  Ref:         504.9 us    21.3 TF
+
+======================================================================
+[3/26] CFG1: b=74, h_q=64, topk=128, extra_topk=512, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      145.9 us    85.1 TF  [PASS]
+  TileLang:    377.5 us    32.9 TF  [PASS]
+  Ref:         591.0 us    21.0 TF
+
+======================================================================
+[4/26] CFG1: b=128, h_q=64, topk=128, extra_topk=512, ebs=64
+  Triton:      163.8 us   131.1 TF  [PASS]
+  TileLang:    547.1 us    39.2 TF  [PASS]
+  Ref:        1000.6 us    21.5 TF
+
+======================================================================
+[5/26] CFG1: b=148, h_q=64, topk=128, extra_topk=512, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      253.4 us    98.0 TF  [PASS]
+  TileLang:    662.7 us    37.5 TF  [PASS]
+  Ref:        1136.1 us    21.9 TF
+
+======================================================================
+[6/26] CFG1: b=256, h_q=64, topk=128, extra_topk=512, ebs=64
+  Triton:      332.3 us   129.3 TF  [PASS]
+  TileLang:    873.8 us    49.2 TF  [PASS]
+  Ref:        1808.1 us    23.8 TF
+
+======================================================================
+[7/26] CFG2: b=2, h_q=128, topk=128, extra_topk=1024, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      137.4 us     8.8 TF  [PASS]
+  TileLang:    380.0 us     3.2 TF  [PASS]
+  Ref:         238.9 us     5.1 TF
+
+======================================================================
+[8/26] CFG2: b=64, h_q=128, topk=128, extra_topk=1024, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      251.7 us   153.5 TF  [PASS]
+  TileLang:    923.7 us    41.8 TF  [PASS]
+  Ref:        1041.4 us    37.1 TF
+
+======================================================================
+[9/26] CFG2: b=74, h_q=128, topk=128, extra_topk=1024, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      307.8 us   145.2 TF  [PASS]
+  TileLang:   1135.3 us    39.4 TF  [PASS]
+  Ref:        1331.7 us    33.6 TF
+
+======================================================================
+[10/26] CFG2: b=128, h_q=128, topk=128, extra_topk=1024, ebs=64
+  Triton:      428.6 us   180.4 TF  [PASS]
+  TileLang:   1767.1 us    43.7 TF  [PASS]
+  Ref:        1932.0 us    40.0 TF
+
+======================================================================
+[11/26] CFG2: b=148, h_q=128, topk=128, extra_topk=1024, ebs=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      551.2 us   162.2 TF  [PASS]
+  TileLang:   2168.4 us    41.2 TF  [PASS]
+  Ref:        2185.7 us    40.9 TF
+
+======================================================================
+[12/26] CFG2: b=256, h_q=128, topk=128, extra_topk=1024, ebs=64
+  Triton:      796.1 us   194.2 TF  [PASS]
+  TileLang:   3630.7 us    42.6 TF  [PASS]
+  Ref:        3636.2 us    42.5 TF
+
+======================================================================
+[13/26] CFG3: b=2, h_q=64, topk=128, extra_topk=1024, ebs=2
+  Triton:      143.9 us     1.8 TF  [PASS]
+  TileLang:    372.8 us     0.7 TF  [PASS]
+  Ref:         272.6 us     0.9 TF
+
+======================================================================
+[14/26] CFG3: b=64, h_q=64, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      153.7 us    74.0 TF  [PASS]
+  TileLang:    407.1 us    27.9 TF  [PASS]
+  Ref:         889.5 us    12.8 TF
+
+======================================================================
+[15/26] CFG3: b=74, h_q=64, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      226.3 us    50.8 TF  [PASS]
+  TileLang:    435.3 us    26.4 TF  [PASS]
+  Ref:        1019.1 us    11.3 TF
+
+======================================================================
+[16/26] CFG3: b=128, h_q=64, topk=128, extra_topk=1024, ebs=2
+  Triton:      277.5 us    75.5 TF  [PASS]
+  TileLang:    961.1 us    21.8 TF  [PASS]
+  Ref:        1617.3 us    13.0 TF
+
+======================================================================
+[17/26] CFG3: b=148, h_q=64, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      369.9 us    64.4 TF  [PASS]
+  TileLang:   1174.5 us    20.3 TF  [PASS]
+  Ref:        1847.4 us    12.9 TF
+
+======================================================================
+[18/26] CFG3: b=256, h_q=64, topk=128, extra_topk=1024, ebs=2
+  Triton:      489.8 us    87.8 TF  [PASS]
+  TileLang:   1516.5 us    28.3 TF  [PASS]
+  Ref:        2973.4 us    14.5 TF
+
+======================================================================
+[19/26] CFG4: b=2, h_q=128, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      130.7 us     2.7 TF  [PASS]
+  TileLang:    372.0 us     0.9 TF  [PASS]
+  Ref:         263.8 us     1.3 TF
+
+======================================================================
+[20/26] CFG4: b=64, h_q=128, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      212.9 us   102.8 TF  [PASS]
+  TileLang:    922.6 us    23.7 TF  [PASS]
+  Ref:        1088.9 us    20.1 TF
+
+======================================================================
+[21/26] CFG4: b=74, h_q=128, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      296.8 us    83.5 TF  [PASS]
+  TileLang:   1181.1 us    21.0 TF  [PASS]
+  Ref:        1252.2 us    19.8 TF
+
+======================================================================
+[22/26] CFG4: b=128, h_q=128, topk=128, extra_topk=1024, ebs=2
+  Triton:      390.2 us   117.3 TF  [PASS]
+  TileLang:   1686.9 us    27.1 TF  [PASS]
+  Ref:        1971.2 us    23.2 TF
+
+======================================================================
+[23/26] CFG4: b=148, h_q=128, topk=128, extra_topk=1024, ebs=2
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:      489.9 us   101.2 TF  [PASS]
+  TileLang:   2031.4 us    24.4 TF  [PASS]
+  Ref:        2233.4 us    22.2 TF
+
+======================================================================
+[24/26] CFG4: b=256, h_q=128, topk=128, extra_topk=1024, ebs=2
+  Triton:      738.5 us   116.8 TF  [PASS]
+  TileLang:   3356.3 us    25.7 TF  [PASS]
+  Ref:        3726.1 us    23.2 TF
+
+======================================================================
+[25/26] PeakPerf: b=148, h_q=64, topk=16384
+  Triton:     4686.8 us   135.6 TF  [PASS]
+  TileLang:   9371.2 us    67.8 TF  [PASS]
+  Ref:       19485.4 us    32.6 TF
+
+======================================================================
+[26/26] PeakPerf: b=148, h_q=128, topk=16384
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  Triton:     5884.5 us   216.0 TF  [PASS]
+  TileLang:  18236.2 us    69.7 TF  [PASS]
+  Ref:       24297.0 us    52.3 TF
+
+
+
+                                                              Sparse MLA Decode Benchmark: Triton vs TileLang Native
+┏━━━━━┳━━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃     ┃          ┃ Batch ┃   Num ┃        ┃  extra ┃  Comp ┃      Triton ┃  Triton ┃ Triton ┃    TileLang ┃ TileLang ┃ TileLang ┃  Ref(PyTorch) ┃  Triton ┃ TileLang ┃  Triton vs ┃
+┃   # ┃ Config   ┃  Size ┃ Heads ┃   topk ┃   topk ┃  /Mem ┃ Latency(us) ┃  TFLOPS ┃ Pass?  ┃ Latency(us) ┃   TFLOPS ┃  Pass?   ┃   Latency(us) ┃  vs Ref ┃   vs Ref ┃   TileLang ┃
+┡━━━━━╇━━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━┩
+│   1 │ CFG1     │     2 │    64 │    128 │    512 │   171 │       147.2 │     2.3 │   Y    │       374.9 │      0.9 │    Y     │         239.7 │   1.63x │    0.64x │      2.55x │
+│   2 │ CFG1     │    64 │    64 │    128 │    512 │   174 │       133.9 │    80.2 │   Y    │       378.4 │     28.4 │    Y     │         504.9 │   3.77x │    1.33x │      2.83x │
+│   3 │ CFG1     │    74 │    64 │    128 │    512 │   172 │       145.9 │    85.1 │   Y    │       377.5 │     32.9 │    Y     │         591.0 │   4.05x │    1.57x │      2.59x │
+│   4 │ CFG1     │   128 │    64 │    128 │    512 │   173 │       163.8 │   131.1 │   Y    │       547.1 │     39.2 │    Y     │        1000.6 │   6.11x │    1.83x │      3.34x │
+│   5 │ CFG1     │   148 │    64 │    128 │    512 │   175 │       253.4 │    98.0 │   Y    │       662.7 │     37.5 │    Y     │        1136.1 │   4.48x │    1.71x │      2.61x │
+│   6 │ CFG1     │   256 │    64 │    128 │    512 │   173 │       332.3 │   129.3 │   Y    │       873.8 │     49.2 │    Y     │        1808.1 │   5.44x │    2.07x │      2.63x │
+│   7 │ CFG2     │     2 │   128 │    128 │   1024 │   332 │       137.4 │     8.8 │   Y    │       380.0 │      3.2 │    Y     │         238.9 │   1.74x │    0.63x │      2.77x │
+│   8 │ CFG2     │    64 │   128 │    128 │   1024 │   343 │       251.7 │   153.5 │   Y    │       923.7 │     41.8 │    Y     │        1041.4 │   4.14x │    1.13x │      3.67x │
+│   9 │ CFG2     │    74 │   128 │    128 │   1024 │   347 │       307.8 │   145.2 │   Y    │      1135.3 │     39.4 │    Y     │        1331.7 │   4.33x │    1.17x │      3.69x │
+│  10 │ CFG2     │   128 │   128 │    128 │   1024 │   346 │       428.6 │   180.4 │   Y    │      1767.1 │     43.7 │    Y     │        1932.0 │   4.51x │    1.09x │      4.12x │
+│  11 │ CFG2     │   148 │   128 │    128 │   1024 │   338 │       551.2 │   162.2 │   Y    │      2168.4 │     41.2 │    Y     │        2185.7 │   3.97x │    1.01x │      3.93x │
+│  12 │ CFG2     │   256 │   128 │    128 │   1024 │   343 │       796.1 │   194.2 │   Y    │      3630.7 │     42.6 │    Y     │        3636.2 │   4.57x │    1.00x │      4.56x │
+│  13 │ CFG3     │     2 │    64 │    128 │   1024 │   158 │       143.9 │     1.8 │   Y    │       372.8 │      0.7 │    Y     │         272.6 │   1.89x │    0.73x │      2.59x │
+│  14 │ CFG3     │    64 │    64 │    128 │   1024 │   178 │       153.7 │    74.0 │   Y    │       407.1 │     27.9 │    Y     │         889.5 │   5.79x │    2.18x │      2.65x │
+│  15 │ CFG3     │    74 │    64 │    128 │   1024 │   171 │       226.3 │    50.8 │   Y    │       435.3 │     26.4 │    Y     │        1019.1 │   4.50x │    2.34x │      1.92x │
+│  16 │ CFG3     │   128 │    64 │    128 │   1024 │   171 │       277.5 │    75.5 │   Y    │       961.1 │     21.8 │    Y     │        1617.3 │   5.83x │    1.68x │      3.46x │
+│  17 │ CFG3     │   148 │    64 │    128 │   1024 │   174 │       369.9 │    64.4 │   Y    │      1174.5 │     20.3 │    Y     │        1847.4 │   4.99x │    1.57x │      3.18x │
+│  18 │ CFG3     │   256 │    64 │    128 │   1024 │   174 │       489.8 │    87.8 │   Y    │      1516.5 │     28.3 │    Y     │        2973.4 │   6.07x │    1.96x │      3.10x │
+│  19 │ CFG4     │     2 │   128 │    128 │   1024 │   193 │       130.7 │     2.7 │   Y    │       372.0 │      0.9 │    Y     │         263.8 │   2.02x │    0.71x │      2.85x │
+│  20 │ CFG4     │    64 │   128 │    128 │   1024 │   278 │       212.9 │   102.8 │   Y    │       922.6 │     23.7 │    Y     │        1088.9 │   5.12x │    1.18x │      4.33x │
+│  21 │ CFG4     │    74 │   128 │    128 │   1024 │   273 │       296.8 │    83.5 │   Y    │      1181.1 │     21.0 │    Y     │        1252.2 │   4.22x │    1.06x │      3.98x │
+│  22 │ CFG4     │   128 │   128 │    128 │   1024 │   289 │       390.2 │   117.3 │   Y    │      1686.9 │     27.1 │    Y     │        1971.2 │   5.05x │    1.17x │      4.32x │
+│  23 │ CFG4     │   148 │   128 │    128 │   1024 │   272 │       489.9 │   101.2 │   Y    │      2031.4 │     24.4 │    Y     │        2233.4 │   4.56x │    1.10x │      4.15x │
+│  24 │ CFG4     │   256 │   128 │    128 │   1024 │   273 │       738.5 │   116.8 │   Y    │      3356.3 │     25.7 │    Y     │        3726.1 │   5.05x │    1.11x │      4.54x │
+│  25 │ PeakPerf │   148 │    64 │  16384 │      - │   323 │      4686.8 │   135.6 │   Y    │      9371.2 │     67.8 │    Y     │       19485.4 │   4.16x │    2.08x │      2.00x │
+│  26 │ PeakPerf │   148 │   128 │  16384 │      - │   648 │      5884.5 │   216.0 │   Y    │     18236.2 │     69.7 │    Y     │       24297.0 │   4.13x │    1.33x │      3.10x │
+└─────┴──────────┴───────┴───────┴────────┴────────┴───────┴─────────────┴─────────┴────────┴─────────────┴──────────┴──────────┴───────────────┴─────────┴──────────┴────────────┘
+                                      Latency in microseconds. TFLOPS = Tera floating-point ops per second. Speedup = Ref_time / Kernel_time.
+
+================================================================================
+CORRECTNESS
+================================================================================
+  Triton:   26/26 passed
+  TileLang: 26/26 passed
+
+================================================================================
+PERFORMANCE (geometric mean)
+================================================================================
+  Triton   TFlops geomean: 63.6
+  TileLang TFlops geomean: 19.9
+  Ref      TFlops geomean: 15.6
+
+  Triton   vs Ref speedup geomean: 4.07x
+  TileLang vs Ref speedup geomean: 1.27x
+  Triton vs TileLang speedup geomean: 3.20x
+
+================================================================================
+TIMING METHODOLOGY
+================================================================================
+  Both kernels are timed using CUDA events (kk.bench_by_cuda_events).
+
+  Triton timing includes:
+    - Python dispatch logic (d_qk check, scope detection)
+    - q.reshape() + .contiguous()
+    - indices.reshape() + .contiguous()
+    - Internal buffer allocation (gathered_kv, invalid_mask, output, lse)
+    - Gather kernel launch (fused_gather_dequant_fp8)
+    - Attention kernel launch (_unified_sparse_decode_kernel)
+    - Output reshape (view)
+
+  TileLang timing includes:
+    - q.contiguous() (real copy if input is non-contiguous)
+    - indices.contiguous() (real copy if input is non-contiguous)
+    - _build_fp8_combined_view (reinterpret KV cache as uint32, no copy)
+    - _pick_inner_iter (Python heuristic, ~1us)
+    - Partial kernel launch (dpsk_v4_fp8_partial_kernel)
+    - Combine kernel launch (dpsk_v4_combine_kernel)
+    - Output tensor allocation
+
+  NOT included in either timing:
+    - NaN sanitization (test artifact, not needed in production)
+
+  Fairness assessment:
+    Both timings measure the full end-to-end API call including all
+    data preparation. Triton receives raw (possibly non-contiguous)
+    tensors and handles reshape/contiguous internally. TileLang also
+    includes .contiguous() copies in its timed region. The .contiguous()
+    overhead is ~1% of total time for production configs.
+
+
+Results saved to /home/danli103/FlashMLA_latest/tests/benchmark_report_results.csv
+
+All correctness checks passed.
+
