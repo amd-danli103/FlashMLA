@@ -1,0 +1,438 @@
+Loading tilelang libs from dev root: /opt/tilelang/build
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] merge tuned file under model_configs/ and configs/ /sgl-workspace/aiter/aiter/configs/bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/dsv3_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv
+/sgl-workspace/aiter/aiter/jit/core.py:214: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
+================================================================================
+ENVIRONMENT INFO
+================================================================================
+  Python:        3.10.12 (/opt/venv/bin/python3)
+  PyTorch:       2.9.1+rocm7.2.0.git7e1940d4
+  ROCm (HIP):    7.2.26015-fc0010cf6a
+  GPU:           AMD Instinct MI355X
+  GPU Arch:      gfx950 (compute capability 9.5)
+  GPU Memory:    288.0 GB
+  Triton:        3.6.0
+  TileLang:      0.1.7.post3+cuda.gita55a8230
+  VISIBLE_DEVS:  (not set)
+  Hostname:      smci355-ccs-aus-m11-25
+  Date:          2026-05-06 06:02:44
+================================================================================
+
+========================================================================
+3-Way Sparse MLA Prefill Kernel Benchmark
+========================================================================
+  Triton:   available
+  Tilelang: available
+  Ref:      available (PyTorch)
+
+  Tilelang constraints on AMD/HIP:
+    - topk must be 2048
+    - tail_dim must be > 0 (d_qk > d_v, e.g. d_qk=576)
+    - inputs must be contiguous
+    - attn_sink / topk_length not supported in prefill path
+========================================================================
+
+Total test cases: 79
+  Correctness cases: 58
+  Performance cases: 21
+
+========================================================================
+Config: s_q=1, s_kv=256, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=256, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=256, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=512, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=512, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=512, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1521, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1521, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1521, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1840, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1840, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1840, topk=256, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=256, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=256, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=256, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=512, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=512, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=512, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1521, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1521, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1521, topk=512, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1840, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1840, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1840, topk=256, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=256, topk=256, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=256, topk=256, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=256, topk=256, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=512, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=512, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=512, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1521, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1521, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1521, topk=512, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=256, topk=256, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=62, s_kv=256, topk=256, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=213, s_kv=256, topk=256, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=256 != 2048)
+========================================================================
+Config: s_q=1, s_kv=512, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=512, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=512, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=1521, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=62, s_kv=1521, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=213, s_kv=1521, topk=512, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang: SKIPPED (topk=512 != 2048)
+========================================================================
+Config: s_q=1, s_kv=4096, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=62, s_kv=4096, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=213, s_kv=4096, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1024, s_kv=4096, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1, s_kv=8192, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=62, s_kv=8192, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=213, s_kv=8192, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1024, s_kv=8192, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1, s_kv=4096, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=62, s_kv=4096, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=213, s_kv=4096, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1024, s_kv=4096, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+/opt/venv/lib/python3.10/site-packages/torch/utils/_device.py:103: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:345.)
+  return func(*args, **kwargs)
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=62, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=213, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=1024, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  [Correctness] Triton vs Ref:
+  [Correctness] Tilelang vs Ref:
+========================================================================
+Config: s_q=4096, s_kv=8192, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  Triton:        947 us    290.2 TFlops    2.83 TBps
+  Tilelang: SKIPPED (topk=512 != 2048)
+  Ref:          6353 us     43.3 TFlops    0.42 TBps
+  Speedup vs Ref:  Triton=6.71x
+========================================================================
+Config: s_q=4096, s_kv=32768, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  Triton:        963 us    285.5 TFlops    2.79 TBps
+  Tilelang: SKIPPED (topk=512 != 2048)
+  Ref:          6434 us     42.7 TFlops    0.42 TBps
+  Speedup vs Ref:  Triton=6.68x
+========================================================================
+Config: s_q=4096, s_kv=49152, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  Triton:        969 us    283.8 TFlops    2.77 TBps
+  Tilelang: SKIPPED (topk=512 != 2048)
+  Ref:          6398 us     43.0 TFlops    0.42 TBps
+  Speedup vs Ref:  Triton=6.60x
+========================================================================
+Config: s_q=4096, s_kv=65536, topk=512, h_q=64, d_qk=512, d_v=512, tail_dim=0
+  Triton:        988 us    278.1 TFlops    2.72 TBps
+  Tilelang: SKIPPED (topk=512 != 2048)
+  Ref:          6432 us     42.7 TFlops    0.42 TBps
+  Speedup vs Ref:  Triton=6.51x
+========================================================================
+Config: s_q=4096, s_kv=8192, topk=1024, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  Triton:       3140 us    350.2 TFlops    1.71 TBps
+  Tilelang: SKIPPED (topk=1024 != 2048)
+  Ref:         16130 us     68.2 TFlops    0.33 TBps
+  Speedup vs Ref:  Triton=5.14x
+========================================================================
+Config: s_q=4096, s_kv=32768, topk=1024, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  Triton:       3231 us    340.3 TFlops    1.66 TBps
+  Tilelang: SKIPPED (topk=1024 != 2048)
+  Ref:         16342 us     67.3 TFlops    0.33 TBps
+  Speedup vs Ref:  Triton=5.06x
+========================================================================
+Config: s_q=4096, s_kv=49152, topk=1024, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  Triton:       3217 us    341.8 TFlops    1.67 TBps
+  Tilelang: SKIPPED (topk=1024 != 2048)
+  Ref:         16250 us     67.7 TFlops    0.33 TBps
+  Speedup vs Ref:  Triton=5.05x
+========================================================================
+Config: s_q=4096, s_kv=65536, topk=1024, h_q=128, d_qk=512, d_v=512, tail_dim=0
+  Triton:       3260 us    337.3 TFlops    1.65 TBps
+  Tilelang: SKIPPED (topk=1024 != 2048)
+  Ref:         16351 us     67.2 TFlops    0.33 TBps
+  Speedup vs Ref:  Triton=5.02x
+========================================================================
+Config: s_q=4096, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7641 us    305.8 TFlops    1.41 TBps
+  Tilelang:    42587 us     54.9 TFlops    0.25 TBps
+  Ref:         31596 us     73.9 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.14x  Tilelang=0.74x
+  Triton vs Tilelang: 5.57x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=32768, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7744 us    301.7 TFlops    1.40 TBps
+  Tilelang:    42695 us     54.7 TFlops    0.25 TBps
+  Ref:         31876 us     73.3 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.12x  Tilelang=0.75x
+  Triton vs Tilelang: 5.51x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=65536, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:      64414 us     36.3 TFlops    0.17 TBps
+  Tilelang:    42724 us     54.7 TFlops    0.25 TBps
+  Ref:         31615 us     73.9 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=0.49x  Tilelang=0.74x
+  Triton vs Tilelang: 0.66x (Tilelang is faster)
+========================================================================
+Config: s_q=4096, s_kv=98304, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7813 us    299.0 TFlops    1.38 TBps
+  Tilelang:    42779 us     54.6 TFlops    0.25 TBps
+  Ref:         32187 us     72.6 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.12x  Tilelang=0.75x
+  Triton vs Tilelang: 5.48x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=131072, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       8132 us    287.3 TFlops    1.33 TBps
+  Tilelang:    42907 us     54.5 TFlops    0.25 TBps
+  Ref:         32459 us     72.0 TFlops    0.33 TBps
+  Speedup vs Ref:  Triton=3.99x  Tilelang=0.76x
+  Triton vs Tilelang: 5.28x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=8192, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  Triton:       3829 us    305.1 TFlops    2.67 TBps
+  Tilelang:    21356 us     54.7 TFlops    0.48 TBps
+  Ref:         23411 us     49.9 TFlops    0.44 TBps
+  Speedup vs Ref:  Triton=6.11x  Tilelang=1.10x
+  Triton vs Tilelang: 5.58x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=32768, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  Triton:       3880 us    301.1 TFlops    2.64 TBps
+  Tilelang:    21241 us     55.0 TFlops    0.48 TBps
+  Ref:         23531 us     49.6 TFlops    0.43 TBps
+  Speedup vs Ref:  Triton=6.06x  Tilelang=1.11x
+  Triton vs Tilelang: 5.47x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=49152, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  Triton:       3891 us    300.3 TFlops    2.63 TBps
+  Tilelang:    21241 us     55.0 TFlops    0.48 TBps
+  Ref:         23487 us     49.7 TFlops    0.44 TBps
+  Speedup vs Ref:  Triton=6.04x  Tilelang=1.11x
+  Triton vs Tilelang: 5.46x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=65536, topk=2048, h_q=64, d_qk=576, d_v=512, tail_dim=64
+  Triton:       3905 us    299.1 TFlops    2.62 TBps
+  Tilelang:    21265 us     54.9 TFlops    0.48 TBps
+  Ref:         23490 us     49.7 TFlops    0.44 TBps
+  Speedup vs Ref:  Triton=6.01x  Tilelang=1.10x
+  Triton vs Tilelang: 5.44x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=8192, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7641 us    305.8 TFlops    1.41 TBps
+  Tilelang:    42566 us     54.9 TFlops    0.25 TBps
+  Ref:         31549 us     74.1 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.13x  Tilelang=0.74x
+  Triton vs Tilelang: 5.57x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=32768, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7733 us    302.1 TFlops    1.40 TBps
+  Tilelang:    42633 us     54.8 TFlops    0.25 TBps
+  Ref:         31842 us     73.4 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.12x  Tilelang=0.75x
+  Triton vs Tilelang: 5.51x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=49152, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7775 us    300.5 TFlops    1.39 TBps
+  Tilelang:    42656 us     54.8 TFlops    0.25 TBps
+  Ref:         31785 us     73.5 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.09x  Tilelang=0.75x
+  Triton vs Tilelang: 5.49x (Triton is faster)
+========================================================================
+Config: s_q=4096, s_kv=65536, topk=2048, h_q=128, d_qk=576, d_v=512, tail_dim=64
+  Triton:       7775 us    300.5 TFlops    1.39 TBps
+  Tilelang:    42690 us     54.7 TFlops    0.25 TBps
+  Ref:         31765 us     73.6 TFlops    0.34 TBps
+  Speedup vs Ref:  Triton=4.09x  Tilelang=0.74x
+  Triton vs Tilelang: 5.49x (Triton is faster)
+
+========================================================================
+SUMMARY
+========================================================================
+  Total cases:       79
+  Tilelang tested:   29
+  Tilelang skipped:  50
+
+All 79 cases passed!
+
