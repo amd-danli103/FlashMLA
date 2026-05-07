@@ -252,45 +252,51 @@ def _fused_gather_attn_model1_kernel(
     q_7 = tl.load(q_base + offs_h[:, None] * stride_q_h + (7*TILE_SIZE + offs_tile[None, :]) * stride_q_d,
                   mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
 
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH:
+        topk_len = tl.load(TopkLength + batch_idx)
+
     for n_start in range(0, topk, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < topk
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH or n_start < topk_len
+        if should_compute:
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < topk
 
-        idx_ptrs = Indices + pid_t * stride_idx_t + offs_n * stride_idx_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices + pid_t * stride_idx_t + offs_n * stride_idx_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH:
-            topk_len = tl.load(TopkLength + batch_idx)
-            is_invalid = is_invalid | (offs_n >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH:
+                is_invalid = is_invalid | (offs_n >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size
-        offset_in_block = indices_clamped % block_size
+            block_idx = indices_clamped // block_size
+            offset_in_block = indices_clamped % block_size
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        stride_kv_block_64 = tl.cast(stride_kv_block, tl.int64)
-        kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            stride_kv_block_64 = tl.cast(stride_kv_block, tl.int64)
+            kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        # Use helper function for KV processing
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            # Use helper function for KV processing
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     # Finalize
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
@@ -634,88 +640,100 @@ def _fused_gather_attn_model1_dual_scope_kernel(
     # ========================================================================
     # Process MAIN scope
     # ========================================================================
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH_MAIN:
+        topk_len = tl.load(TopkLength_Main + batch_idx)
+
     for n_start in range(0, topk_main, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < topk_main
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH_MAIN or n_start < topk_len
+        if should_compute:
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < topk_main
 
-        idx_ptrs = Indices_Main + pid_t * stride_idx_main_t + offs_n * stride_idx_main_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices_Main + pid_t * stride_idx_main_t + offs_n * stride_idx_main_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH_MAIN:
-            topk_len = tl.load(TopkLength_Main + batch_idx)
-            is_invalid = is_invalid | (offs_n >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH_MAIN:
+                is_invalid = is_invalid | (offs_n >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size_main
-        offset_in_block = indices_clamped % block_size_main
+            block_idx = indices_clamped // block_size_main
+            offset_in_block = indices_clamped % block_size_main
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        stride_kv_block_main_64 = tl.cast(stride_kv_block_main, tl.int64)
-        kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            stride_kv_block_main_64 = tl.cast(stride_kv_block_main, tl.int64)
+            kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        # Use helper function for KV processing
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            # Use helper function for KV processing
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     # ========================================================================
     # Process EXTRA scope
     # ========================================================================
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH_EXTRA:
+        topk_len = tl.load(TopkLength_Extra + batch_idx)
+
     for n_start in range(0, topk_extra, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < topk_extra
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH_EXTRA or n_start < topk_len
+        if should_compute:
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < topk_extra
 
-        idx_ptrs = Indices_Extra + pid_t * stride_idx_extra_t + offs_n * stride_idx_extra_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices_Extra + pid_t * stride_idx_extra_t + offs_n * stride_idx_extra_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH_EXTRA:
-            topk_len = tl.load(TopkLength_Extra + batch_idx)
-            is_invalid = is_invalid | (offs_n >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH_EXTRA:
+                is_invalid = is_invalid | (offs_n >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size_extra
-        offset_in_block = indices_clamped % block_size_extra
+            block_idx = indices_clamped // block_size_extra
+            offset_in_block = indices_clamped % block_size_extra
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        stride_kv_block_extra_64 = tl.cast(stride_kv_block_extra, tl.int64)
-        kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            stride_kv_block_extra_64 = tl.cast(stride_kv_block_extra, tl.int64)
+            kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        # Use helper function for KV processing
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            # Use helper function for KV processing
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     # ========================================================================
     # Finalize: compute LSE and output
@@ -877,86 +895,98 @@ def _fused_gather_attn_model1_dual_scope_splitk_kernel(
     main_start = k_start
     main_end = tl.minimum(k_end, topk_main)
 
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH_MAIN:
+        topk_len = tl.load(TopkLength_Main + batch_idx)
+
     for n_start in range(main_start, main_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < main_end
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH_MAIN or n_start < topk_len
+        if should_compute:
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < main_end
 
-        idx_ptrs = Indices_Main + pid_t * stride_idx_main_t + offs_n * stride_idx_main_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices_Main + pid_t * stride_idx_main_t + offs_n * stride_idx_main_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH_MAIN:
-            topk_len = tl.load(TopkLength_Main + batch_idx)
-            is_invalid = is_invalid | (offs_n >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH_MAIN:
+                is_invalid = is_invalid | (offs_n >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size_main
-        offset_in_block = indices_clamped % block_size_main
+            block_idx = indices_clamped // block_size_main
+            offset_in_block = indices_clamped % block_size_main
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            kv_block_base = KV_Cache_Main + block_idx_64 * stride_kv_block_main_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size_main * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     # Process EXTRA scope portion (indices topk_main to topk_main+topk_extra-1)
     extra_global_start = tl.maximum(k_start, topk_main)
     extra_global_end = k_end
 
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH_EXTRA:
+        topk_len = tl.load(TopkLength_Extra + batch_idx)
+
     for n_global in range(extra_global_start, extra_global_end, BLOCK_N):
-        offs_n_local = (n_global - topk_main) + tl.arange(0, BLOCK_N)
-        offs_n_global = n_global + tl.arange(0, BLOCK_N)
-        mask_n = offs_n_global < extra_global_end
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH_EXTRA or (n_global - topk_main) < topk_len
+        if should_compute:
+            offs_n_local = (n_global - topk_main) + tl.arange(0, BLOCK_N)
+            offs_n_global = n_global + tl.arange(0, BLOCK_N)
+            mask_n = offs_n_global < extra_global_end
 
-        idx_ptrs = Indices_Extra + pid_t * stride_idx_extra_t + offs_n_local * stride_idx_extra_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices_Extra + pid_t * stride_idx_extra_t + offs_n_local * stride_idx_extra_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH_EXTRA:
-            topk_len = tl.load(TopkLength_Extra + batch_idx)
-            is_invalid = is_invalid | (offs_n_local >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH_EXTRA:
+                is_invalid = is_invalid | (offs_n_local >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size_extra
-        offset_in_block = indices_clamped % block_size_extra
+            block_idx = indices_clamped // block_size_extra
+            offset_in_block = indices_clamped % block_size_extra
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            kv_block_base = KV_Cache_Extra + block_idx_64 * stride_kv_block_extra_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size_extra * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     # Finalize: compute partial LSE and store partial output
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
@@ -1315,44 +1345,50 @@ def _fused_gather_attn_model1_splitk_kernel(
 
     stride_kv_block_64 = tl.cast(stride_kv_block, tl.int64)
 
+    # Early-exit: pre-load topk_len and skip invalid blocks
+    if HAS_TOPK_LENGTH:
+        topk_len = tl.load(TopkLength + batch_idx)
+
     for n_start in range(k_start, k_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < k_end
+        # Skip entire block if beyond valid topk range
+        should_compute = not HAS_TOPK_LENGTH or n_start < topk_len
+        if should_compute:
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < k_end
 
-        idx_ptrs = Indices + pid_t * stride_idx_t + offs_n * stride_idx_k
-        indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
+            idx_ptrs = Indices + pid_t * stride_idx_t + offs_n * stride_idx_k
+            indices = tl.load(idx_ptrs, mask=mask_n, other=-1)
 
-        is_invalid = indices == -1
-        if HAS_TOPK_LENGTH:
-            topk_len = tl.load(TopkLength + batch_idx)
-            is_invalid = is_invalid | (offs_n >= topk_len)
+            is_invalid = indices == -1
+            if HAS_TOPK_LENGTH:
+                is_invalid = is_invalid | (offs_n >= topk_len)
 
-        valid = mask_n & ~is_invalid
-        indices_clamped = tl.maximum(indices, 0)
+            valid = mask_n & ~is_invalid
+            indices_clamped = tl.maximum(indices, 0)
 
-        block_idx = indices_clamped // block_size
-        offset_in_block = indices_clamped % block_size
+            block_idx = indices_clamped // block_size
+            offset_in_block = indices_clamped % block_size
 
-        block_idx_64 = block_idx.to(tl.int64)
-        offset_in_block_64 = offset_in_block.to(tl.int64)
+            block_idx_64 = block_idx.to(tl.int64)
+            offset_in_block_64 = offset_in_block.to(tl.int64)
 
-        kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
-        nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
-        scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
+            kv_block_base = KV_Cache + block_idx_64 * stride_kv_block_64
+            nope_rope_offset = offset_in_block_64 * BYTES_PER_TOKEN_DATA
+            scale_base_offset = block_size * BYTES_PER_TOKEN_DATA + offset_in_block_64 * BYTES_PER_TOKEN_SCALE
 
-        valid_2d = valid[:, None]
+            valid_2d = valid[:, None]
 
-        # Use helper function for KV processing
-        acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
-            _process_kv_block_aggressive(
-                kv_block_base, nope_rope_offset, scale_base_offset,
-                valid, valid_2d,
-                q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
-                acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
-                m_i, l_i,
-                offs_tile, sm_scale,
-                TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
-            )
+            # Use helper function for KV processing
+            acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_i, l_i = \
+                _process_kv_block_aggressive(
+                    kv_block_base, nope_rope_offset, scale_base_offset,
+                    valid, valid_2d,
+                    q_0, q_1, q_2, q_3, q_4, q_5, q_6, q_7,
+                    acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7,
+                    m_i, l_i,
+                    offs_tile, sm_scale,
+                    TILE_SIZE, D_NOPE, LOG2E, BLOCK_H, BLOCK_N,
+                )
 
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
     is_lonely_q = (l_i == 0.0)
